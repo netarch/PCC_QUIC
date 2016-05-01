@@ -4,7 +4,7 @@
  *  Created on: March 28, 2016
  *      Authors:
  *               Xuefeng Zhu (zhuxuefeng1994@126.com)
- *               Mo Dong (mdong@illinois.edu)
+ *               Mo Dong (modong2@illinois.edu)
  */
 #ifndef NET_QUIC_CONGESTION_CONTROL_PCC_SENDER_H_
 #define NET_QUIC_CONGESTION_CONTROL_PCC_SENDER_H_
