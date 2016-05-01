@@ -4,7 +4,7 @@
  *  Created on: March 28, 2016
  *      Authors:
  *               Xuefeng Zhu (zhuxuefeng1994@126.com)
- *               Mo Dong (mdong@illinois.edu)
+ *               Mo Dong (modong2@illinois.edu)
  */
 #include <stdio.h>
 
