@@ -254,39 +254,45 @@ PCCUtility::PCCUtility()
   }
 
 void PCCUtility::OnMonitorStart(MonitorNumber current_monitor) {
-  switch (state_) {
-    case STARTING:
-      current_rate_ *= 2;
-      start_rate_array[current_monitor] = current_rate_;
-      return;
-    case GUESSING:
-      if (continous_guess_count_ == MAX_COUNTINOUS_GUESS) {
-        continous_guess_count_ = 0;
-      }
+  UtilityState old_state;
+  do {
+    old_state = state_;
+    switch (state_) {
+      case STARTING:
+        current_rate_ *= 2;
+        start_rate_array[current_monitor] = current_rate_;
+        break;
+      case GUESSING:
+        if (continous_guess_count_ == MAX_COUNTINOUS_GUESS) {
+          continous_guess_count_ = 0;
+        }
 
-      state_ = RECORDING;
-      continous_guess_count_++;
+        state_ = RECORDING;
+        continous_guess_count_++;
 
-      for (int i = 0; i < NUMBER_OF_PROBE; i += 2) {
-        int rand_dir = rand() % 2 * 2 - 1;
+        for (int i = 0; i < NUMBER_OF_PROBE; i += 2) {
+          int rand_dir = rand() % 2 * 2 - 1;
 
-        guess_stat_bucket[i].rate = current_rate_
-            + rand_dir * continous_guess_count_ * GRANULARITY * current_rate_;
-        guess_stat_bucket[i + 1].rate = current_rate_
-            - rand_dir * continous_guess_count_ * GRANULARITY * current_rate_;
-      }
+          guess_stat_bucket[i].rate = current_rate_
+              + rand_dir * continous_guess_count_ * GRANULARITY * current_rate_;
+          guess_stat_bucket[i + 1].rate = current_rate_
+              - rand_dir * continous_guess_count_ * GRANULARITY * current_rate_;
+        }
 
-      for (int i = 0; i < NUMBER_OF_PROBE; i++) {
-        guess_stat_bucket[i].monitor = (current_monitor + i) % NUM_MONITOR;
-      }
-    case RECORDING:
-      current_rate_ = guess_stat_bucket[guess_time_].rate;
-      guess_time_++;
+        for (int i = 0; i < NUMBER_OF_PROBE; i++) {
+          guess_stat_bucket[i].monitor = (current_monitor + i) % NUM_MONITOR;
+        }
+        break;
+      case RECORDING:
+        current_rate_ = guess_stat_bucket[guess_time_].rate;
+        guess_time_++;
 
-      if (guess_time_ == NUMBER_OF_PROBE) {
-        guess_time_ = 0;
-      }
-  }
+        if (guess_time_ == NUMBER_OF_PROBE) {
+          guess_time_ = 0;
+        }
+        break;
+    }
+  } while (old_state != state_)
 }
 
 void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
@@ -394,6 +400,7 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
         }
         previous_utility_ = current_utility;
       }
+      return;
   }
 }
 
