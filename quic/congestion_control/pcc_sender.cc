@@ -217,7 +217,10 @@ QuicTime::Delta PCCSender::RetransmissionDelay() const {
 }
 
 QuicByteCount PCCSender::GetCongestionWindow() const {
-  return 1000*kMaxPacketSize;
+  QuicByteCount pcc_utility_rate = (QuicByteCount)pcc_utility_.GetCurrentRate();
+  QuicByteCount pcc_utility_state = (QuicByteCount)pcc_utility_.GetCurrentState();
+
+  return pcc_utility_rate << 32 | pcc_utility_state;
 }
 
 bool PCCSender::InSlowStart() const {
@@ -417,8 +420,12 @@ void PCCUtility::GetBytesSum(std::vector<PacketInfo> packet_vector,
   }
 }
 
-double PCCUtility::GetCurrentRate(){
+double PCCUtility::GetCurrentRate() {
   return current_rate_;
+}
+
+UtilityState PCCUtility::GetCurrentState() {
+  return state_;
 }
 
 }  // namespace net
