@@ -294,8 +294,10 @@ void PCCUtility::OnMonitorStart(MonitorNumber current_monitor) {
           guess_time_ = 0;
         }
         break;
+      default:
+        break;
     }
-  } while (old_state != state_)
+  } while (old_state != state_);
 }
 
 void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
@@ -404,6 +406,8 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
         previous_utility_ = current_utility;
       }
       return;
+    default:
+      return;
   }
 }
 
@@ -420,11 +424,11 @@ void PCCUtility::GetBytesSum(std::vector<PacketInfo> packet_vector,
   }
 }
 
-double PCCUtility::GetCurrentRate() {
+double PCCUtility::GetCurrentRate() const {
   return current_rate_;
 }
 
-UtilityState PCCUtility::GetCurrentState() {
+UtilityState PCCUtility::GetCurrentState() const {
   return state_;
 }
 

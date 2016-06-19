@@ -95,9 +95,9 @@ class PCCUtility {
                     MonitorNumber current_monitor,
                     MonitorNumber end_monitor);
 
-  double GetCurrentRate();
+  double GetCurrentRate() const;
 
-  UtilityState GetCurrentState();
+  UtilityState GetCurrentState() const;
 
  private:
   UtilityState state_;
