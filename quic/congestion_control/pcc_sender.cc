@@ -325,7 +325,14 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
     case STARTING:
       if (end_monitor == 0) current_utility /= 2;
 
-      if (end_monitor - previous_monitor_ > 1) {
+      double tmp_rate = total * 8 / time;
+      if (current_rate_ - tmp_rate > 50 && current_rate_ > 300) {
+        state_ = GUESSING;
+        current_rate_ = tmp_rate;
+        return;
+      }
+
+      if (end_monitor - previous_monitor_ > 10) {
           state_ = GUESSING;
           current_rate_ = previous_monitor_ == -1 ?
             start_rate_array[0] : start_rate_array[previous_monitor_];
