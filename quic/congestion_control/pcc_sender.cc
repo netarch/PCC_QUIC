@@ -270,7 +270,7 @@ PCCUtility::PCCUtility()
     num_recorded_(0),
     guess_time_(0),
     continous_guess_count_(0),
-    target_monitor_(0),
+    target_monitor_(-1),
     change_direction_(0),
     change_intense_(1) {
     for (int i = 0; i < NUM_MONITOR; i++) {
