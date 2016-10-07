@@ -8,8 +8,9 @@
  */
 #include <stdio.h>
 
-#include "net/quic/congestion_control/pcc_sender.h"
-#include "net/quic/congestion_control/rtt_stats.h"
+#include "net/quic/core/congestion_control/pcc_sender.h"
+#include "net/quic/core/congestion_control/rtt_stats.h"
+#include "net/quic/core/quic_time.h"
 #include "base/time/time.h"
 
 namespace net {
@@ -51,22 +52,18 @@ void PCCSender::SetNumEmulatedConnections(int num_connections) {
 
 }
 
-void PCCSender::SetMaxCongestionWindow(
-    QuicByteCount max_congestion_window) {
-}
-
 bool PCCSender::OnPacketSent(
     QuicTime sent_time,
     QuicByteCount bytes_in_flight,
     QuicPacketNumber packet_number,
     QuicByteCount bytes,
     HasRetransmittableData has_retransmittable_data) {
-
-  if (previous_timer_.Subtract(QuicTime::Zero()).IsZero()) {
+  
+  if (!previous_timer_.IsInitialized()) {
     previous_timer_ = sent_time;
   }
 
-  if (sent_time.Subtract(previous_timer_).ToSeconds()) {
+  if ((sent_time - previous_timer_).ToSeconds()) {
     printf("rtt %ldus\n", rtt_stats_->smoothed_rtt().ToMicroseconds());
     printf("sent at rate %f mbps\n", (double)send_bytes_*8 / 1024 / 1024);
     printf("throughput rate %f mbps\n\n", (double)ack_bytes_*8 / 1024 / 1024);
@@ -79,12 +76,12 @@ bool PCCSender::OnPacketSent(
   }
 
   // TODO : case for retransmission
-  if (current_monitor_end_time_.Subtract(QuicTime::Zero()).IsZero()) {
+  if (!current_monitor_end_time_.IsInitialized()) {
     StartMonitor(sent_time);
     monitors_[current_monitor_].start_seq_num = packet_number;
     ideal_next_packet_send_time_ = sent_time;
   } else {
-    QuicTime::Delta diff = sent_time.Subtract(current_monitor_end_time_);
+    QuicTime::Delta diff = sent_time - current_monitor_end_time_;
     if (diff.ToMicroseconds() > 0) {
       monitors_[current_monitor_].state = WAITING;
       monitors_[current_monitor_].end_transmission_time = sent_time;
@@ -97,8 +94,9 @@ bool PCCSender::OnPacketSent(
   packet_info.bytes = bytes;
   monitors_[current_monitor_].packet_vector.push_back(packet_info);
   QuicTime::Delta delay = QuicTime::Delta::FromMicroseconds(
-    bytes * 8 * base::Time::kMicrosecondsPerSecond / pcc_utility_.GetCurrentRate() / 1024 / 1024);
-  ideal_next_packet_send_time_ = ideal_next_packet_send_time_.Add(delay);
+      bytes * 8 * base::Time::kMicrosecondsPerSecond /
+    pcc_utility_.GetCurrentRate() / 1024 / 1024);
+  ideal_next_packet_send_time_ = ideal_next_packet_send_time_ + delay;
   return true;
 }
 
@@ -107,14 +105,14 @@ void PCCSender::StartMonitor(QuicTime sent_time){
   pcc_utility_.OnMonitorStart(current_monitor_);
 
   // calculate monitor interval and monitor end time
-  double rand_factor = double(rand() % 3) / 10;
-  int64 srtt = rtt_stats_->latest_rtt().ToMicroseconds();
+  double rand_factor = 0.1 + (double(rand() % 3) / 10);
+  int64_t srtt = rtt_stats_->latest_rtt().ToMicroseconds(); //FIXME: int64
   if (srtt == 0) {
     srtt = rtt_stats_->initial_rtt_us();
   }
   QuicTime::Delta monitor_interval =
-      QuicTime::Delta::FromMicroseconds(srtt * (1.5 + rand_factor));
-  current_monitor_end_time_ = sent_time.Add(monitor_interval);
+      QuicTime::Delta::FromMicroseconds(srtt * (1.0 + rand_factor));
+  current_monitor_end_time_ = sent_time + monitor_interval;
 
   monitors_[current_monitor_].state = SENDING;
   monitors_[current_monitor_].srtt = srtt;
@@ -191,20 +189,20 @@ void PCCSender::OnRetransmissionTimeout(bool packets_retransmitted) {
 
 QuicTime::Delta PCCSender::TimeUntilSend(
       QuicTime now,
-      QuicByteCount bytes_in_flight,
-      HasRetransmittableData has_retransmittable_data) const {
+      QuicByteCount bytes_in_flight) const {
     // If the next send time is within the alarm granularity, send immediately.
-  if (ideal_next_packet_send_time_ > now.Add(alarm_granularity_)) {
+  if (ideal_next_packet_send_time_ > now + alarm_granularity_) {
+    QuicTime::Delta packet_delay = ideal_next_packet_send_time_ - now;
     DVLOG(1) << "Delaying packet: "
-             << ideal_next_packet_send_time_.Subtract(now).ToMicroseconds();
-    return ideal_next_packet_send_time_.Subtract(now);
+             << packet_delay.ToMicroseconds();
+    return packet_delay;
   }
 
   DVLOG(1) << "Sending packet now";
   return QuicTime::Delta::Zero();
 }
 
-QuicBandwidth PCCSender::PacingRate() const {
+QuicBandwidth PCCSender::PacingRate(QuicByteCount bytes_in_flight) const {
   return QuicBandwidth::Zero();
 }
 
@@ -239,16 +237,40 @@ CongestionControlType PCCSender::GetCongestionControlType() const {
   return kPcc;
 }
 
+std::string PCCSender::GetDebugState() const {
+  std::string msg;
+  // Maybe have PccUtility dump state.
+  const PCCUtility &u = pcc_utility_;
+  StrAppend(&msg, "[st=", u.state_, ",");
+  StrAppend(&msg, "r=", u.current_rate_, ",");
+  StrAppend(&msg, "pu=", u.previous_utility_, ",");
+  StrAppend(&msg, "prtt=", u.previous_rtt_, ",");
+  StrAppend(&msg, "(gt=", u.guess_time_, ",");
+  StrAppend(&msg, "nr=", u.num_recorded_, "),");
+  StrAppend(&msg, "(dir=", u.change_direction_, ",");
+  StrAppend(&msg, "ci=", u.change_intense_, ",");
+  StrAppend(&msg, "cm=", (int)current_monitor_, ",");
+  StrAppend(&msg, "tm=", (int)u.target_monitor_, ")] ");
+
+  const PCCMonitor &m = monitors_[current_monitor_];
+  StrAppend(&msg, "[ms=", m.state, ",");
+  StrAppend(&msg, "tx(", m.start_time.ToDebuggingValue(), "-");
+  StrAppend(&msg, ">", m.end_transmission_time.ToDebuggingValue(), "),");
+  StrAppend(&msg, "sn(", m.start_seq_num, "-");
+  StrAppend(&msg, ">", m.end_seq_num, ")]");
+  return msg;
+}
+
 PCCUtility::PCCUtility()
-  : state_(STARTING),
-    current_rate_(10),
+  : state_(GUESSING),
+    current_rate_(2),
     previous_utility_(-10000),
     previous_rtt_(0),
     previous_monitor_(-1),
     num_recorded_(0),
     guess_time_(0),
     continous_guess_count_(0),
-    tartger_monitor_(0),
+    target_monitor_(0),
     change_direction_(0),
     change_intense_(1) {
     for (int i = 0; i < NUM_MONITOR; i++) {
@@ -294,7 +316,11 @@ void PCCUtility::OnMonitorStart(MonitorNumber current_monitor) {
           guess_time_ = 0;
         }
         break;
-      default:
+      case MOVING:
+        break;
+     default:
+        LOG(FATAL) << "unhandled switch.  old_state = "
+                   << old_state << " and state = " << state_;
         break;
     }
   } while (old_state != state_);
@@ -308,27 +334,29 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
   double loss = 0;
   GetBytesSum(pcc_monitor.packet_vector, total, loss);
 
-  int64 time =
-      pcc_monitor.end_transmission_time.Subtract(pcc_monitor.start_time).ToMicroseconds();
+  int64_t time = //FIXME: int64
+      (pcc_monitor.end_transmission_time - pcc_monitor.start_time).ToMicroseconds();
 
-  int64 srtt = pcc_monitor.srtt;
+  int64_t srtt = pcc_monitor.srtt; //FIXME: int64
   if (previous_rtt_ == 0) previous_rtt_ = srtt;
 
   double current_utility = ((total - loss) / time *
-    (1 - 1 / ( 1 + exp(-1000 * (loss / total - 0.05)))) *
-    (1 - 1 / (1 + exp(-10 * (1 - previous_rtt_ / double(srtt))))) - 1 * loss / time) / 1 * 1000;
+    (1 - 1 / ( 1 + exp(-1000 * (loss / total - 0.05)))) -
+    1 * loss / time) / 1 * 1000;
 
   previous_rtt_ = srtt;
 
 
+  double actual_tx_rate = 0;
   switch (state_) {
     case STARTING:
+      {
       if (end_monitor == 0) current_utility /= 2;
 
-      double tmp_rate = total * 8 / time;
-      if (current_rate_ - tmp_rate > 50 && current_rate_ > 300) {
+      actual_tx_rate = total * 8 / time;
+      if (current_rate_ - actual_tx_rate > 50 && current_rate_ > 300) {
         state_ = GUESSING;
-        current_rate_ = tmp_rate;
+        current_rate_ = actual_tx_rate;
         return;
       }
 
@@ -347,7 +375,9 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
         current_rate_ = start_rate_array[previous_monitor_];
       }
       return;
+      }
     case RECORDING:
+      {
       // find corresponding monitor
       for (int i = 0; i < NUMBER_OF_PROBE; i++) {
         if (end_monitor == guess_stat_bucket[i].monitor) {
@@ -381,24 +411,25 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
 
           previous_utility_ = 0;
           continous_guess_count_ = 0;
-          tartger_monitor_ = (current_monitor + 1) % NUM_MONITOR;
+          target_monitor_ = (current_monitor + 1) % NUM_MONITOR;
         }
       }
       return;
+      }
     case MOVING:
-      if (end_monitor == tartger_monitor_) {
-        // FIX: better name for tmp_rate?
-        double tmp_rate = total * 8 / time;
-        if (current_rate_ - tmp_rate > 10 && current_rate_ > 200) {
+      {
+      if (end_monitor == target_monitor_) {
+        actual_tx_rate = total * 8 / time;
+        if (current_rate_ - actual_tx_rate > 10 && current_rate_ > 200) {
           state_ = GUESSING;
-          current_rate_ = tmp_rate;
+          current_rate_ = actual_tx_rate;
           return;
         }
 
         bool continue_moving = current_utility > previous_utility_ || change_intense_ == 1;
         if (continue_moving){
           change_intense_ += 1;
-          tartger_monitor_ = (current_monitor + 1) % NUM_MONITOR;
+          target_monitor_ = (current_monitor + 1) % NUM_MONITOR;
         }
 
         double change_amount =
@@ -413,8 +444,11 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
         previous_utility_ = current_utility;
       }
       return;
+      }
+    case GUESSING:
+      break;
     default:
-      return;
+      break;
   }
 }
 

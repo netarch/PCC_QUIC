@@ -6,19 +6,19 @@
  *               Xuefeng Zhu (zhuxuefeng1994@126.com)
  *               Mo Dong (modong2@illinois.edu)
  */
-#ifndef NET_QUIC_CONGESTION_CONTROL_PCC_SENDER_H_
-#define NET_QUIC_CONGESTION_CONTROL_PCC_SENDER_H_
+#ifndef NET_QUIC_CORE_CONGESTION_CONTROL_PCC_SENDER_H_
+#define NET_QUIC_CORE_CONGESTION_CONTROL_PCC_SENDER_H_
 
 # include <vector>
 
 #include "base/basictypes.h"
 #include "base/compiler_specific.h"
 #include "net/base/net_export.h"
-#include "net/quic/congestion_control/send_algorithm_interface.h"
-#include "net/quic/quic_bandwidth.h"
-#include "net/quic/quic_connection_stats.h"
-#include "net/quic/quic_protocol.h"
-#include "net/quic/quic_time.h"
+#include "net/quic/core/congestion_control/send_algorithm_interface.h"
+#include "net/quic/core/quic_bandwidth.h"
+#include "net/quic/core/quic_connection_stats.h"
+#include "net/quic/core/quic_protocol.h"
+#include "net/quic/core/quic_time.h"
 
 namespace net {
 typedef int MonitorNumber;
@@ -36,7 +36,7 @@ enum PacketState {
 };
 
 enum UtilityState {
-  STARTING,
+  STARTING = 0,
   GUESSING,
   RECORDING,
   MOVING
@@ -57,7 +57,7 @@ struct PacketInfo {
 
 struct PCCMonitor {
   MonitorState state;
-  int64 srtt;
+  int64_t srtt; //FIXME
 
   // time statics
   QuicTime start_time;
@@ -117,7 +117,7 @@ class PCCUtility {
 
 
   // variables used for moving phase
-  MonitorNumber tartger_monitor_;
+  MonitorNumber target_monitor_;
 
   int change_direction_;
   int change_intense_;
@@ -141,7 +141,6 @@ class NET_EXPORT_PRIVATE PCCSender : public SendAlgorithmInterface {
       const CachedNetworkParameters& cached_network_params,
       bool max_bandwidth_resumption) override;
   void SetNumEmulatedConnections(int num_connections) override;
-  void SetMaxCongestionWindow(QuicByteCount max_congestion_window) override;
   void OnCongestionEvent(bool rtt_updated,
                          QuicByteCount bytes_in_flight,
                          const CongestionVector& acked_packets,
@@ -155,9 +154,8 @@ class NET_EXPORT_PRIVATE PCCSender : public SendAlgorithmInterface {
   void OnConnectionMigration() override {}
   QuicTime::Delta TimeUntilSend(
       QuicTime now,
-      QuicByteCount bytes_in_flight,
-      HasRetransmittableData has_retransmittable_data) const override;
-  QuicBandwidth PacingRate() const override;
+      QuicByteCount bytes_in_flight) const override;
+  QuicBandwidth PacingRate(QuicByteCount bytes_in_flight) const override;
   QuicBandwidth BandwidthEstimate() const override;
   QuicTime::Delta RetransmissionDelay() const override;
   QuicByteCount GetCongestionWindow() const override;
@@ -165,10 +163,16 @@ class NET_EXPORT_PRIVATE PCCSender : public SendAlgorithmInterface {
   bool InRecovery() const override;
   QuicByteCount GetSlowStartThreshold() const override;
   CongestionControlType GetCongestionControlType() const override;
+  
+  std::string GetDebugState() const override;
+  
+  void OnApplicationLimited(QuicByteCount bytes_in_flight) override {};
+  
   // End implementation of SendAlgorithmInterface.
 
  private:
-  const QuicTime::Delta alarm_granularity_ = QuicTime::Delta::FromMicroseconds(1);
+  const QuicTime::Delta alarm_granularity_ =
+      QuicTime::Delta::FromMicroseconds(1);
 
   // PCC monitor variable
   MonitorNumber current_monitor_;
