@@ -20,6 +20,8 @@
 #include "net/quic/core/quic_protocol.h"
 #include "net/quic/core/quic_time.h"
 
+//#define DEBUG_
+
 namespace net {
 typedef int MonitorNumber;
 
@@ -136,11 +138,11 @@ class NET_EXPORT_PRIVATE PCCSender : public SendAlgorithmInterface {
 
   // SendAlgorithmInterface methods.
   void SetFromConfig(const QuicConfig& config,
-                     Perspective perspective) override;
+                     Perspective perspective) override {};
   void ResumeConnectionState(
       const CachedNetworkParameters& cached_network_params,
-      bool max_bandwidth_resumption) override;
-  void SetNumEmulatedConnections(int num_connections) override;
+      bool max_bandwidth_resumption) override {};
+  void SetNumEmulatedConnections(int num_connections) override {};
   void OnCongestionEvent(bool rtt_updated,
                          QuicByteCount bytes_in_flight,
                          const CongestionVector& acked_packets,
@@ -150,7 +152,7 @@ class NET_EXPORT_PRIVATE PCCSender : public SendAlgorithmInterface {
                     QuicPacketNumber packet_number,
                     QuicByteCount bytes,
                     HasRetransmittableData is_retransmittable) override;
-  void OnRetransmissionTimeout(bool packets_retransmitted) override;
+  void OnRetransmissionTimeout(bool packets_retransmitted) override {};
   void OnConnectionMigration() override {}
   QuicTime::Delta TimeUntilSend(
       QuicTime now,
@@ -177,6 +179,7 @@ class NET_EXPORT_PRIVATE PCCSender : public SendAlgorithmInterface {
   // PCC monitor variable
   MonitorNumber current_monitor_;
   QuicTime current_monitor_end_time_;
+  //bool current_monitor_early_end_;
 
   PCCMonitor monitors_[NUM_MONITOR];
   PCCUtility pcc_utility_;
@@ -191,11 +194,14 @@ class NET_EXPORT_PRIVATE PCCSender : public SendAlgorithmInterface {
   void EndMonitor(MonitorNumber monitor_num);
   // Get the monitor corresponding to the sequence number
   MonitorNumber GetMonitor(QuicPacketNumber sequence_number);
-
+  
+#ifdef DEBUG_
   // logging utility
   QuicTime previous_timer_;
   QuicByteCount send_bytes_;
   QuicByteCount ack_bytes_;
+#endif
+  
   DISALLOW_COPY_AND_ASSIGN(PCCSender);
 };
 

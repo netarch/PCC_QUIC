@@ -26,31 +26,29 @@ PCCMonitor::PCCMonitor()
 PCCMonitor::~PCCMonitor(){
 }
 
+#ifdef DEBUG_
 PCCSender::PCCSender(const RttStats* rtt_stats)
   : current_monitor_(-1),
     current_monitor_end_time_(QuicTime::Zero()),
+    //current_monitor_early_end_(false),
     rtt_stats_(rtt_stats),
     ideal_next_packet_send_time_(QuicTime::Zero()),
     previous_timer_(QuicTime::Zero()),
     send_bytes_(0),
-    ack_bytes_(0){
+    ack_bytes_(0) {
 }
+#else
+PCCSender::PCCSender(const RttStats* rtt_stats)
+  : current_monitor_(-1),
+    current_monitor_end_time_(QuicTime::Zero()),
+    //current_monitor_early_end_(false),
+    rtt_stats_(rtt_stats),
+    ideal_next_packet_send_time_(QuicTime::Zero()) {
+}
+#endif
 
 
 PCCSender::~PCCSender() {}
-
-void PCCSender::SetFromConfig(const QuicConfig& config,
-                                 Perspective perspective) {
-}
-
-void PCCSender::ResumeConnectionState(
-    const CachedNetworkParameters& cached_network_params,
-    bool max_bandwidth_resumption) {
-}
-
-void PCCSender::SetNumEmulatedConnections(int num_connections) {
-
-}
 
 bool PCCSender::OnPacketSent(
     QuicTime sent_time,
@@ -59,6 +57,7 @@ bool PCCSender::OnPacketSent(
     QuicByteCount bytes,
     HasRetransmittableData has_retransmittable_data) {
   
+#ifdef DEBUG_
   if (!previous_timer_.IsInitialized()) {
     previous_timer_ = sent_time;
   }
@@ -74,6 +73,7 @@ bool PCCSender::OnPacketSent(
   } else {
     send_bytes_ += bytes;
   }
+#endif
 
   // TODO : case for retransmission
   if (!current_monitor_end_time_.IsInitialized()) {
@@ -82,11 +82,13 @@ bool PCCSender::OnPacketSent(
     ideal_next_packet_send_time_ = sent_time;
   } else {
     QuicTime::Delta diff = sent_time - current_monitor_end_time_;
+    //if (diff.ToMicroseconds() > 0 || current_monitor_early_end_) {
     if (diff.ToMicroseconds() > 0) {
       monitors_[current_monitor_].state = WAITING;
       monitors_[current_monitor_].end_transmission_time = sent_time;
       monitors_[current_monitor_].end_seq_num = packet_number;
       current_monitor_end_time_ = QuicTime::Zero();
+      //current_monitor_early_end_ = false;
     }
   }
   PacketInfo packet_info;
@@ -119,6 +121,7 @@ void PCCSender::StartMonitor(QuicTime sent_time){
   monitors_[current_monitor_].start_time = sent_time;
   monitors_[current_monitor_].end_time = QuicTime::Zero();
   monitors_[current_monitor_].end_transmission_time = QuicTime::Zero();
+  monitors_[current_monitor_].end_seq_num = -1;
   monitors_[current_monitor_].packet_vector.clear();
 
 }
@@ -151,7 +154,9 @@ void PCCSender::OnCongestionEvent(
     }
     int pos = it->first - monitors_[monitor_num].start_seq_num;
     monitors_[monitor_num].packet_vector[pos].state = ACK;
+#ifdef DEBUG_
     ack_bytes_ += monitors_[monitor_num].packet_vector[pos].bytes;
+#endif
 
     if (it->first == monitors_[monitor_num].end_seq_num) {
       EndMonitor(monitor_num);
@@ -179,12 +184,10 @@ MonitorNumber PCCSender::GetMonitor(QuicPacketNumber sequence_number) {
     result = (result + 99) % NUM_MONITOR;
   } while (result != current_monitor_);
 
+#ifdef DEBIG_
   printf("Monitor is not found\n");
+#endif
   return -1;
-}
-
-void PCCSender::OnRetransmissionTimeout(bool packets_retransmitted) {
-
 }
 
 QuicTime::Delta PCCSender::TimeUntilSend(
@@ -258,11 +261,12 @@ std::string PCCSender::GetDebugState() const {
   StrAppend(&msg, ">", m.end_transmission_time.ToDebuggingValue(), "),");
   StrAppend(&msg, "sn(", m.start_seq_num, "-");
   StrAppend(&msg, ">", m.end_seq_num, ")]");
+  
   return msg;
 }
 
 PCCUtility::PCCUtility()
-  : state_(GUESSING),
+  : state_(STARTING),
     current_rate_(2),
     previous_utility_(-10000),
     previous_rtt_(0),
@@ -324,6 +328,9 @@ void PCCUtility::OnMonitorStart(MonitorNumber current_monitor) {
         break;
     }
   } while (old_state != state_);
+#ifdef DEBUG_
+  printf("START MONITOR %d (rate=%.4f)\n", current_monitor, current_rate_);
+#endif
 }
 
 void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
@@ -341,38 +348,26 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
   if (previous_rtt_ == 0) previous_rtt_ = srtt;
 
   double current_utility = ((total - loss) / time *
-    (1 - 1 / ( 1 + exp(-1000 * (loss / total - 0.05)))) -
-    1 * loss / time) / 1 * 1000;
+    (1 - 1 / ( 1 + exp(-1000 * (loss / total - 0.05)))) *
+    (1 - 1 / (1 + exp(-10 * (1 - previous_rtt_ / double(srtt))))) - 1 * loss / time) / 1 * 1000;
+  //double current_utility = ((total - loss) / time *
+  //  (1 - 1 / ( 1 + exp(-1000 * (loss / total - 0.05))))
+  //  - 1 * loss / time) / 1 * 1000;
 
   previous_rtt_ = srtt;
+#ifdef DEBUG_  
+  printf("END MONITOR %d (utility=%.4f)\n", end_monitor, current_utility);
+#endif
 
 
   double actual_tx_rate = 0;
   switch (state_) {
     case STARTING:
       {
-      if (end_monitor == 0) current_utility /= 2;
-
-      actual_tx_rate = total * 8 / time;
-      if (current_rate_ - actual_tx_rate > 50 && current_rate_ > 300) {
+      previous_utility_ = current_utility;
+      previous_monitor_ = end_monitor;
+      if (end_monitor == 2) {
         state_ = GUESSING;
-        current_rate_ = actual_tx_rate;
-        return;
-      }
-
-      if (end_monitor - previous_monitor_ > 10) {
-          state_ = GUESSING;
-          current_rate_ = previous_monitor_ == -1 ?
-            start_rate_array[0] : start_rate_array[previous_monitor_];
-        return;
-      }
-
-      if (previous_utility_ < current_utility) {
-        previous_utility_ = current_utility;
-        previous_monitor_ = end_monitor;
-      } else {
-        state_ = GUESSING;
-        current_rate_ = start_rate_array[previous_monitor_];
       }
       return;
       }
@@ -407,18 +402,23 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
           change_intense_ = 1;
           double change_amount = (continous_guess_count_/ 2 + 1)
               * change_intense_ * change_direction_ * GRANULARITY * current_rate_;
+          if(change_amount > current_rate_*0.1) {
+            change_amount = 0.1 * current_rate_;
+          }
           current_rate_ += change_amount;
 
           previous_utility_ = 0;
           continous_guess_count_ = 0;
           target_monitor_ = (current_monitor + 1) % NUM_MONITOR;
         }
+        //current_monitor_early_end_ = true;
       }
       return;
       }
     case MOVING:
       {
       if (end_monitor == target_monitor_) {
+        //current_monitor_early_end_ = true;
         actual_tx_rate = total * 8 / time;
         if (current_rate_ - actual_tx_rate > 10 && current_rate_ > 200) {
           state_ = GUESSING;
@@ -434,6 +434,9 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
 
         double change_amount =
             change_intense_ * GRANULARITY * current_rate_ * change_direction_;
+        if(change_amount > current_rate_*0.1) {
+          change_amount = 0.1 * current_rate_;
+        }
 
         if (continue_moving){
           current_rate_ += change_amount;
