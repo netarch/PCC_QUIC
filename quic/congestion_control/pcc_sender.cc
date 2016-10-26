@@ -402,7 +402,7 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
           change_intense_ = 1;
           double change_amount = (continous_guess_count_/ 2 + 1)
               * change_intense_ * change_direction_ * GRANULARITY * current_rate_;
-          if(change_amount > current_rate_*0.1) {
+          if(current_rate_ > 80 && change_amount > current_rate_*0.1) {
             change_amount = 0.1 * current_rate_;
           }
           current_rate_ += change_amount;
@@ -434,7 +434,7 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
 
         double change_amount =
             change_intense_ * GRANULARITY * current_rate_ * change_direction_;
-        if(change_amount > current_rate_*0.1) {
+        if(current_rate_ > 80 && change_amount > current_rate_*0.1) {
           change_amount = 0.1 * current_rate_;
         }
 
