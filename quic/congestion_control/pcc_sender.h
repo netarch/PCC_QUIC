@@ -3,6 +3,7 @@
  *
  *  Created on: March 28, 2016
  *      Authors:
+ *               Tong Meng (tongm2@illinois.edu)
  *               Xuefeng Zhu (zhuxuefeng1994@126.com)
  *               Mo Dong (modong2@illinois.edu)
  */
@@ -100,6 +101,8 @@ class PCCUtility {
   double GetCurrentRate() const;
 
   UtilityState GetCurrentState() const;
+  bool GetEarlyEndFlag() const;
+  void SetEarlyEndFlag(bool newFlag);
 
  private:
   UtilityState state_;
@@ -107,6 +110,8 @@ class PCCUtility {
   double current_rate_;
   double previous_utility_;
   double previous_rtt_;
+  
+  bool current_monitor_early_end_;
 
   double start_rate_array[NUM_MONITOR];
   MonitorNumber previous_monitor_;
@@ -114,12 +119,14 @@ class PCCUtility {
   // variables used for guess phase
   int num_recorded_;
   int guess_time_;
-  int continous_guess_count_;
+  int continuous_guess_count_;
   GuessStat guess_stat_bucket[NUMBER_OF_PROBE];
 
 
   // variables used for moving phase
   MonitorNumber target_monitor_;
+  double waiting_rate_;
+  double probing_rate_;
 
   int change_direction_;
   int change_intense_;
@@ -179,7 +186,6 @@ class NET_EXPORT_PRIVATE PCCSender : public SendAlgorithmInterface {
   // PCC monitor variable
   MonitorNumber current_monitor_;
   QuicTime current_monitor_end_time_;
-  //bool current_monitor_early_end_;
 
   PCCMonitor monitors_[NUM_MONITOR];
   PCCUtility pcc_utility_;
