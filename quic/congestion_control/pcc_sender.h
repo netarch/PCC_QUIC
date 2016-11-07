@@ -3,9 +3,9 @@
  *
  *  Created on: March 28, 2016
  *      Authors:
- *               Tong Meng (tongm2@illinois.edu)
  *               Xuefeng Zhu (zhuxuefeng1994@126.com)
  *               Mo Dong (modong2@illinois.edu)
+ *               Tong Meng (tongm2@illinois.edu)
  */
 #ifndef NET_QUIC_CORE_CONGESTION_CONTROL_PCC_SENDER_H_
 #define NET_QUIC_CORE_CONGESTION_CONTROL_PCC_SENDER_H_
@@ -112,9 +112,6 @@ class PCCUtility {
   double previous_rtt_;
   
   bool current_monitor_early_end_;
-
-  double start_rate_array[NUM_MONITOR];
-  MonitorNumber previous_monitor_;
 
   // variables used for guess phase
   int num_recorded_;

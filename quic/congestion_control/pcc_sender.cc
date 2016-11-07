@@ -3,9 +3,9 @@
  *
  *  Created on: March 28, 2016
  *      Authors:
- *               Tong Meng (tongm2@illinois.edu)
  *               Xuefeng Zhu (zhuxuefeng1994@126.com)
- *               Mo Dong (modong2@illinois.
+ *               Mo Dong (modong2@illinois.edu)
+ *               Tong Meng (tongm2@illinois.edu)
  */
 #include <stdio.h>
 
@@ -242,6 +242,7 @@ CongestionControlType PCCSender::GetCongestionControlType() const {
 std::string PCCSender::GetDebugState() const {
   std::string msg;
 #ifndef DEBUG_
+  // Maybe have PccUtility dump state.
   const PCCUtility &u = pcc_utility_;
   StrAppend(&msg, "[st=", u.state_, ",");
   StrAppend(&msg, "r=", u.current_rate_, ",");
@@ -267,11 +268,10 @@ std::string PCCSender::GetDebugState() const {
 
 PCCUtility::PCCUtility()
   : state_(STARTING),
-    current_rate_(1),
+    current_rate_(2),
     previous_utility_(0),
     previous_rtt_(0),
     current_monitor_early_end_(false),
-    previous_monitor_(-1),
     num_recorded_(0),
     guess_time_(0),
     continuous_guess_count_(0),
@@ -280,9 +280,6 @@ PCCUtility::PCCUtility()
     probing_rate_(0),
     change_direction_(0),
     change_intense_(1) {
-    for (int i = 0; i < NUM_MONITOR; i++) {
-      start_rate_array[i] = 0;
-    }
   }
 
 void PCCUtility::OnMonitorStart(MonitorNumber current_monitor) {
@@ -291,8 +288,6 @@ void PCCUtility::OnMonitorStart(MonitorNumber current_monitor) {
     old_state = state_;
     switch (state_) {
       case STARTING:
-        current_rate_ *= 2;
-        start_rate_array[current_monitor] = current_rate_;
         break;
       case GUESSING:
         if (continuous_guess_count_ == MAX_COUNTINOUS_GUESS) {
@@ -359,11 +354,13 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
   if (previous_rtt_ == 0) previous_rtt_ = srtt;
 
   double current_utility = ((total - loss) / time *
-    (1 - 1 / ( 1 + exp(-1000 * (loss / total - 0.05)))) *
-    (1 - 1 / (1 + exp(-10 * (1 - previous_rtt_ / double(srtt))))) - 1 * loss / time) / 1 * 1000;
-  //double current_utility = ((total - loss) / time *
-  //  (1 - 1 / ( 1 + exp(-1000 * (loss / total - 0.05))))
-  //  - 1 * loss / time) / 1 * 1000;
+    (1 - 1 / (1 + exp(-1000 * (loss / total - 0.05)))) *
+    (1 - 1 / (1 + exp(-1 * (1 - previous_rtt_ / double(srtt))))) - 1 * loss / time) / 1 * 1000;
+#ifdef DEBUG_
+  double current_utility_nonlatency = ((total - loss) / time *
+    (1 - 1 / ( 1 + exp(-1000 * (loss / total - 0.05))))
+    - 1 * loss / time) / 1 * 1000;
+#endif
 
   previous_rtt_ = srtt;
 
@@ -372,9 +369,11 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
     case STARTING:
       {
       previous_utility_ = current_utility;
-      previous_monitor_ = end_monitor;
-      if (end_monitor == 2) {
+      
+      actual_tx_rate = total * 8 / time;
+      if (actual_tx_rate > current_rate_*0.9) {
         state_ = GUESSING;
+        current_rate_ = current_rate_ * 1.5;
       }
       break;
       }
@@ -418,11 +417,9 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
           double utility2 = guess_stat_bucket[3].utility;
           previous_utility_ = (utility1 > utility2) ? utility1 : utility2;
           
-          double change_amount = change_intense_ * change_direction_* GRANULARITY * tmp_rate;
+          double change_amount = change_direction_* GRANULARITY * tmp_rate;
           if(change_direction_ > 0 && utility2 < 0) {
             change_amount = 0.0;
-          } if(tmp_rate > 80 && change_amount > tmp_rate*0.1) {
-            change_amount = 0.1 * tmp_rate;
           }
           current_rate_ = tmp_rate + change_amount;
           probing_rate_ = current_rate_;
@@ -462,7 +459,7 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
             change_intense_ * GRANULARITY * probing_rate_ * change_direction_;
         if(current_utility < 0 && change_direction_ > 0 && continue_moving) {
           change_amount = 0.0;
-        } else if(probing_rate_ > 80 && change_amount > probing_rate_*0.1) {
+        } else if(change_amount > probing_rate_*0.1) {
           change_amount = 0.1 * probing_rate_;
         }
 
@@ -492,9 +489,9 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
   printf("E %2d | st=%d r=%6.3lf pr=%8.2lf prtt=%6.0lf gt=%d/nr=%d/cg=%d ",
       end_monitor, state_, current_rate_, previous_utility_, previous_rtt_,
       guess_time_, num_recorded_, continuous_guess_count_);
-  printf("dir=%d/ci=%d/tm=%2d | %8.2lf %.0lf %.0lf\n",
+  printf("dir=%d/ci=%d/tm=%2d | %8.2lf %9.2lf %.0lf %.0lf %6ld\n",
       change_direction_, change_intense_, (int)target_monitor_,
-      current_utility, total, loss);
+      current_utility, current_utility_nonlatency, total, loss, time);
 #endif
 }
 
