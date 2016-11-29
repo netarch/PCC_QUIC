@@ -12,7 +12,7 @@
 
 # include <vector>
 
-#include "base/basictypes.h"
+//#include "base/basictypes.h"
 #include "base/compiler_specific.h"
 #include "net/base/net_export.h"
 #include "net/quic/core/congestion_control/send_algorithm_interface.h"
@@ -22,6 +22,7 @@
 #include "net/quic/core/quic_time.h"
 
 //#define DEBUG_
+//#define TRACE_
 
 namespace net {
 typedef int MonitorNumber;
@@ -40,9 +41,8 @@ enum PacketState {
 
 enum UtilityState {
   STARTING = 0,
-  GUESSING,
-  RECORDING,
-  MOVING
+  UMOVING,
+  DMOVING
 };
 
 struct PacketInfo {
@@ -60,11 +60,12 @@ struct PacketInfo {
 
 struct PCCMonitor {
   MonitorState state;
-  int64_t srtt; //FIXME
+  int64_t srtt;
+  int64_t ertt;
 
   // time statics
   QuicTime start_time;
-  QuicTime end_time;
+  //QuicTime end_time;
   QuicTime end_transmission_time;
 
   // packet statics
@@ -76,16 +77,9 @@ struct PCCMonitor {
   ~PCCMonitor();
 };
 
-struct GuessStat {
-  MonitorNumber monitor;
-  double rate;
-  double utility;
-};
-
 const int NUM_MONITOR = 100;
-const int NUMBER_OF_PROBE = 4;
-const int MAX_COUNTINOUS_GUESS = 5;
 const double GRANULARITY = 0.05;
+const double MIN_RATE = 4;
 
 class PCCUtility {
  public:
@@ -109,24 +103,14 @@ class PCCUtility {
 
   double current_rate_;
   double previous_utility_;
-  double previous_rtt_;
   
   bool current_monitor_early_end_;
 
-  // variables used for guess phase
-  int num_recorded_;
-  int guess_time_;
-  int continuous_guess_count_;
-  GuessStat guess_stat_bucket[NUMBER_OF_PROBE];
-
-
-  // variables used for moving phase
   MonitorNumber target_monitor_;
   double waiting_rate_;
   double probing_rate_;
-
-  int change_direction_;
-  int change_intense_;
+  
+  int decreasing_intense_;
 
   void GetBytesSum(std::vector<PacketInfo> packet_vector,
                                       double& total,
@@ -198,7 +182,7 @@ class NET_EXPORT_PRIVATE PCCSender : public SendAlgorithmInterface {
   // Get the monitor corresponding to the sequence number
   MonitorNumber GetMonitor(QuicPacketNumber sequence_number);
   
-#ifdef DEBUG_
+#ifdef TRACE_
   // logging utility
   QuicTime previous_timer_;
   QuicByteCount send_bytes_;
