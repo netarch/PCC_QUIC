@@ -63,6 +63,9 @@ struct PCCMonitor {
   double tx_rate;
   int64_t srtt;
   int64_t ertt;
+  double utility;
+  double bw;
+  double loss;
 
   // time statics
   QuicTime start_time;
@@ -93,6 +96,9 @@ const int NUM_MONITOR = 100;
 const int NUMBER_OF_PROBE = 4;
 const int MAX_COUNTINOUS_GUESS = 5;
 const double GRANULARITY = 0.05;
+const double MIN_RATE = 2.0;
+static int tr_current_monitor_ = -1;
+static int tr_last_monitor_ = -1;
 
 class PCCUtility {
  public:

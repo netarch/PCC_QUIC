@@ -36,6 +36,8 @@ PCCSender::PCCSender(const RttStats* rtt_stats)
     previous_timer_(QuicTime::Zero()),
     send_bytes_(0),
     ack_bytes_(0) {
+  tr_current_monitor_ = -1;
+  tr_last_monitor_ = -1;
 }
 #else
 PCCSender::PCCSender(const RttStats* rtt_stats)
@@ -107,14 +109,16 @@ void PCCSender::StartMonitor(QuicTime sent_time){
 
   // calculate monitor interval and monitor end time
   double rand_factor = 0.1 + (double(rand() % 3) / 10);
-  int64_t srtt = rtt_stats_->latest_rtt().ToMicroseconds();
-  //int64_t srtt = rtt_stats_->smoothed_rtt().ToMicroseconds();
+  //int64_t srtt = rtt_stats_->latest_rtt().ToMicroseconds();
+  int64_t srtt = rtt_stats_->smoothed_rtt().ToMicroseconds();
   if (srtt == 0) {srtt = rtt_stats_->initial_rtt_us();}
+  
+  int64_t mrtt = srtt;
   int64_t rtt1000 = int64_t(12000000.0 / pcc_utility_.GetCurrentRate());
-  if (rtt1000 < srtt) {srtt = rtt1000;}
+  if (rtt1000 < 100000 && srtt > 100000) {mrtt = 100000;}
   
   QuicTime::Delta monitor_interval =
-      QuicTime::Delta::FromMicroseconds(srtt * (1.0 + rand_factor));
+      QuicTime::Delta::FromMicroseconds(mrtt * (1.3 + rand_factor));
   // TODO: restrict maximum MI duration
   current_monitor_end_time_ = sent_time + monitor_interval;
 
@@ -171,7 +175,7 @@ void PCCSender::OnCongestionEvent(
 void PCCSender::EndMonitor(MonitorNumber monitor_num) {
   if (monitors_[monitor_num].state == WAITING){
     monitors_[monitor_num].state = FINISHED;
-    monitors_[monitor_num].ertt = rtt_stats_->latest_rtt().ToMicroseconds();
+    monitors_[monitor_num].ertt = rtt_stats_->smoothed_rtt().ToMicroseconds();
     pcc_utility_.OnMonitorEnd(monitors_[monitor_num], current_monitor_,
                               monitor_num);
   }
@@ -247,35 +251,42 @@ CongestionControlType PCCSender::GetCongestionControlType() const {
 
 std::string PCCSender::GetDebugState() const {
   std::string msg;
-#ifndef DEBUG_
-  // Maybe have PccUtility dump state.
-  const PCCUtility &u = pcc_utility_;
-  StrAppend(&msg, "[st=", u.state_, ",");
-  StrAppend(&msg, "r=", u.current_rate_, ",");
-  StrAppend(&msg, "pu=", u.previous_utility_, ",");
-  StrAppend(&msg, "(gt=", u.guess_time_, ",");
-  StrAppend(&msg, "nr=", u.num_recorded_, ",");
-  StrAppend(&msg, "cg=", u.continuous_guess_count_, ")");
-  StrAppend(&msg, "(dir=", u.change_direction_, ",");
-  StrAppend(&msg, "ci=", u.change_intense_, ",");
-  StrAppend(&msg, "cm=", (int)current_monitor_, ",");
-  StrAppend(&msg, "tm=", (int)u.target_monitor_, ")] ");
+  
+  if (tr_current_monitor_ != tr_last_monitor_) {
+    tr_last_monitor_ = tr_current_monitor_;
+    
+    const PCCUtility &u = pcc_utility_;
+    StrAppend(&msg, "[st=", u.state_, ",");
+    StrAppend(&msg, "pu=", u.previous_utility_, ",");
+    StrAppend(&msg, "ig=", u.loss_ignorance_count_, ",");
+    StrAppend(&msg, "(gt=", u.guess_time_, ",");
+    StrAppend(&msg, "nr=", u.num_recorded_, ")");
+    StrAppend(&msg, "(dir=", u.change_direction_, ",");
+    StrAppend(&msg, "ci=", u.change_intense_, ",");
+    StrAppend(&msg, "cm=", (int)current_monitor_, ",");
+    StrAppend(&msg, "tm=", (int)u.target_monitor_, ")] ");
 
-  const PCCMonitor &m = monitors_[current_monitor_];
-  StrAppend(&msg, "[ms=", m.state, ",");
-  StrAppend(&msg, "tx(", m.start_time.ToDebuggingValue(), "-");
-  StrAppend(&msg, ">", m.end_transmission_time.ToDebuggingValue(), "),");
-  StrAppend(&msg, "sn(", m.start_seq_num, "-");
-  StrAppend(&msg, ">", m.end_seq_num, ")]");
-#endif
+    const PCCMonitor &m = monitors_[tr_last_monitor_];
+    int64_t time = 
+      (m.end_transmission_time - m.start_time).ToMicroseconds();
+    int n = m.end_seq_num - m.start_seq_num;
+    StrAppend(&msg, "[M", tr_last_monitor_, ":");
+    StrAppend(&msg, "r=", m.tx_rate, ",");
+    StrAppend(&msg, m.loss, "/", n);
+    StrAppend(&msg, ",t=", time, ",");
+    StrAppend(&msg, m.srtt, "/", m.ertt);
+    StrAppend(&msg, ",", m.utility, "/");
+    StrAppend(&msg, m.bw, " ", "]");
+  }
+  
   return msg;
 }
 
 PCCUtility::PCCUtility()
   : state_(STARTING),
-    current_rate_(2),
-    waiting_rate_(2),
-    probing_rate_(2),
+    current_rate_(MIN_RATE),
+    waiting_rate_(MIN_RATE),
+    probing_rate_(MIN_RATE),
     target_monitor_(1),
     current_monitor_early_end_(false),
     previous_utility_(0),
@@ -409,6 +420,7 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
         } else {
           state_ = GUESSING;
           current_rate_ = actual_bw * (1 - GRANULARITY);
+          if (current_rate_ < MIN_RATE) {current_rate_ = MIN_RATE;}
           probing_rate_ = current_rate_;
           if (waiting_rate_ > current_rate_) {
             waiting_rate_ = current_rate_;
@@ -466,12 +478,13 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
         avg_bw /= NUMBER_OF_PROBE;
         if (avg_ratio < 0.8 || sample_ratio < 0.66) {
           decision = -6;
-        } else if (avg_loss_rate > 0.05) {
+        } else if (sum_total > 500 && avg_loss_rate > 0.05) {
           decision = -2;
         }
 
         if (decision == -6) {
           current_rate_ = avg_bw * (1 - 1.5 * GRANULARITY);
+          if (current_rate_ < MIN_RATE) {current_rate_ = MIN_RATE;}
           state_ = GUESSING;
         } else if (decision == 0) {
           current_rate_ = (guess_stat_bucket[0].rate + guess_stat_bucket[1].rate) / 2;
@@ -494,6 +507,7 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
             change_amount = 0.0;
           }
           current_rate_ = tmp_rate + change_amount;
+          if (current_rate_ < MIN_RATE) {current_rate_ = MIN_RATE;}
           probing_rate_ = current_rate_;
           if(change_direction_ > 0) {
             waiting_rate_ = tmp_rate;
@@ -537,14 +551,14 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
           change_amount = -0.15 * probing_rate_;
         }
 
-        if (rtt_ratio < 0.7) {
+        if (rtt_ratio < 0.7) { //FIXME
           if (change_amount > 0) {
-            current_rate_ = probing_rate_ - change_amount * 2;
+            current_rate_ = probing_rate_ - change_amount * 1.5;
           } else {
-            current_rate_ = probing_rate_ + change_amount * 2;
+            current_rate_ = probing_rate_ + change_amount * 1.5;
           }
-          if (current_rate_ < 0) {current_rate_ = 2.0;}
           if (actual_bw < current_rate_) {current_rate_ = actual_bw;}
+          if (current_rate_ < MIN_RATE) {current_rate_ = MIN_RATE;}
           
           if (continue_moving && change_direction_ < 0) {
             probing_rate_ = waiting_rate_ = current_rate_;
@@ -553,6 +567,7 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
           }
         } else if (continue_moving) {
           current_rate_ = probing_rate_ + change_amount;
+          if (current_rate_ < MIN_RATE) {current_rate_ = MIN_RATE;}
           if(change_direction_ > 0) {
             waiting_rate_ = probing_rate_;
           } else {
@@ -562,6 +577,7 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
         } else {
           // FIXME: use which rate when entering guessing?
           current_rate_ = probing_rate_ - change_amount;
+          if (current_rate_ < MIN_RATE) {current_rate_ = MIN_RATE;}
           state_ = GUESSING;
         }
         previous_utility_ = current_utility;
@@ -574,6 +590,11 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
     default:
       break;
   }
+  
+  tr_current_monitor_ = end_monitor;
+  pcc_monitor.loss = loss;
+  pcc_monitor.utility = current_utility;
+  pcc_monitor.bw = actual_bw;
 
 #ifdef DEBUG_  
   printf("E %2d | st=%d r=%6.3lf pr=%8.2lf gt=%d/nr=%d/cg=%d ",
