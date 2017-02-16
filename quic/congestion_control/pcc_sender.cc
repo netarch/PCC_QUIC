@@ -20,27 +20,46 @@ PCCMonitor::PCCMonitor()
   : start_time(QuicTime::Zero()),
     end_time(QuicTime::Zero()),
     end_transmission_time(QuicTime::Zero()),
+    start_ack_time(QuicTime::Zero()),
+    end_ack_time(QuicTime::Zero()),
     start_seq_num(-1),
-    end_seq_num(-1){
+    end_seq_num(-1) {
+}
+
+PCCMonitor::PCCMonitor(const PCCMonitor& other)
+  : state(other.state),
+    tx_rate(other.tx_rate),
+    srtt(other.srtt),
+    ertt(other.ertt),
+    utility(other.utility),
+    bw(other.bw),
+    loss(other.loss),
+    start_time(other.start_time),
+    end_time(other.end_time),
+    end_transmission_time(other.end_transmission_time),
+    start_ack_time(QuicTime::Zero()),
+    end_ack_time(QuicTime::Zero()),
+    start_seq_num(other.start_seq_num),
+    end_seq_num(other.end_seq_num) {
+  packet_vector = other.packet_vector;
 }
 
 PCCMonitor::~PCCMonitor(){
 }
 
 #ifdef DEBUG_
-PCCSender::PCCSender(const RttStats* rtt_stats)
+PCCSender::PCCSender(const QuicClock* clock, const RttStats* rtt_stats)
   : current_monitor_(-1),
+    last_end_monitor_(-1),
     current_monitor_end_time_(QuicTime::Zero()),
     rtt_stats_(rtt_stats),
     ideal_next_packet_send_time_(QuicTime::Zero()),
     previous_timer_(QuicTime::Zero()),
     send_bytes_(0),
     ack_bytes_(0) {
-  tr_current_monitor_ = -1;
-  tr_last_monitor_ = -1;
 }
 #else
-PCCSender::PCCSender(const RttStats* rtt_stats)
+PCCSender::PCCSender(const QuicClock* clock, const RttStats* rtt_stats)
   : current_monitor_(-1),
     current_monitor_end_time_(QuicTime::Zero()),
     rtt_stats_(rtt_stats),
@@ -130,6 +149,8 @@ void PCCSender::StartMonitor(QuicTime sent_time){
   monitors_[current_monitor_].start_time = sent_time;
   monitors_[current_monitor_].end_time = QuicTime::Zero();
   monitors_[current_monitor_].end_transmission_time = QuicTime::Zero();
+  monitors_[current_monitor_].start_ack_time = QuicTime::Zero();
+  monitors_[current_monitor_].end_ack_time = QuicTime::Zero();
   monitors_[current_monitor_].end_seq_num = -1;
   monitors_[current_monitor_].packet_vector.clear();
 
@@ -138,6 +159,7 @@ void PCCSender::StartMonitor(QuicTime sent_time){
 void PCCSender::OnCongestionEvent(
     bool rtt_updated,
     QuicByteCount bytes_in_flight,
+    QuicTime event_time,
     const CongestionVector& acked_packets,
     const CongestionVector& lost_packets) {
   for (CongestionVector::const_iterator it = lost_packets.cbegin();
@@ -163,6 +185,14 @@ void PCCSender::OnCongestionEvent(
     }
     int pos = it->first - monitors_[monitor_num].start_seq_num;
     monitors_[monitor_num].packet_vector[pos].state = ACK;
+    
+    if (!monitors_[monitor_num].start_ack_time.IsInitialized()) {
+      monitors_[monitor_num].start_ack_time = event_time;
+    }
+    monitors_[monitor_num].end_ack_time = event_time;
+    monitors_[monitor_num].dl_rate += // FIXME
+        monitors_[monitor_num].packet_vector[pos].bytes;
+    
 #ifdef DEBUG_
     ack_bytes_ += monitors_[monitor_num].packet_vector[pos].bytes;
 #endif
@@ -179,6 +209,7 @@ void PCCSender::EndMonitor(MonitorNumber monitor_num) {
     monitors_[monitor_num].ertt = rtt_stats_->smoothed_rtt().ToMicroseconds();
     pcc_utility_.OnMonitorEnd(monitors_[monitor_num], current_monitor_,
                               monitor_num);
+    last_end_monitor_ = monitor_num;
   }
 }
 
@@ -223,10 +254,6 @@ QuicBandwidth PCCSender::BandwidthEstimate() const {
   return QuicBandwidth::Zero();
 }
 
-QuicTime::Delta PCCSender::RetransmissionDelay() const {
-  return QuicTime::Delta::Zero();
-}
-
 QuicByteCount PCCSender::GetCongestionWindow() const {
   QuicByteCount pcc_utility_rate = (QuicByteCount)pcc_utility_.GetCurrentRate();
   QuicByteCount pcc_utility_state = (QuicByteCount)pcc_utility_.GetCurrentState();
@@ -253,33 +280,32 @@ CongestionControlType PCCSender::GetCongestionControlType() const {
 std::string PCCSender::GetDebugState() const {
   std::string msg;
   
-  if (tr_current_monitor_ != tr_last_monitor_) {
-    tr_last_monitor_ = tr_current_monitor_;
-    
-    const PCCUtility &u = pcc_utility_;
-    StrAppend(&msg, "[st=", u.state_, ",");
-    StrAppend(&msg, "pu=", u.previous_utility_, ",");
-    StrAppend(&msg, "ig=", u.loss_ignorance_count_, ",");
-    StrAppend(&msg, "(gt=", u.guess_time_, ",");
-    StrAppend(&msg, "nr=", u.num_recorded_, ")");
-    StrAppend(&msg, "(dir=", u.change_direction_, ",");
-    StrAppend(&msg, "ci=", u.change_intense_, ",");
-    StrAppend(&msg, "cm=", (int)current_monitor_, ",");
-    StrAppend(&msg, "tm=", (int)u.target_monitor_, ")] ");
+  if (last_end_monitor_ >= 0) {
+    const int tm = last_end_monitor_;
+    const PCCMonitor &m = monitors_[tm];
+    if (m.end_time.IsInitialized()) {
+      const PCCUtility &u = pcc_utility_;
+      StrAppend(&msg, "[st=", u.state_, ",");
+      StrAppend(&msg, "pu=", u.previous_utility_, ",");
+      StrAppend(&msg, "(gt=", u.guess_time_, ",");
+      StrAppend(&msg, "nr=", u.num_recorded_, ")");
+      StrAppend(&msg, "(dir=", u.change_direction_, ",");
+      StrAppend(&msg, "ci=", u.change_intense_, ",");
+      StrAppend(&msg, "cm=", (int)current_monitor_, ",");
+      StrAppend(&msg, "tm=", (int)u.target_monitor_, ")] ");
 
-    const PCCMonitor &m = monitors_[tr_last_monitor_];
-    int64_t time = 
-      (m.end_transmission_time - m.start_time).ToMicroseconds();
-    int n = m.end_seq_num - m.start_seq_num;
-    StrAppend(&msg, "[M", tr_last_monitor_, ":");
-    StrAppend(&msg, "r=", m.tx_rate, ",");
-    StrAppend(&msg, m.loss, "/", n);
-    StrAppend(&msg, ",t=", time, ",");
-    StrAppend(&msg, m.srtt, "/", m.ertt);
-    StrAppend(&msg, ",", m.utility, "/");
-    StrAppend(&msg, m.bw, " ", "]");
+      int64_t time = 
+        (m.end_transmission_time - m.start_time).ToMicroseconds();
+      int n = m.end_seq_num - m.start_seq_num;
+      StrAppend(&msg, "M", tm, ":");
+      StrAppend(&msg, "r=", m.tx_rate, ",");
+      StrAppend(&msg, m.loss, "/", n);
+      StrAppend(&msg, ",t=", time, ",");
+      StrAppend(&msg, m.srtt, "/", m.ertt);
+      StrAppend(&msg, ",", m.utility, "/");
+      StrAppend(&msg, m.bw, "/", m.dl_rate);
+    }
   }
-  
   return msg;
 }
 
@@ -592,10 +618,12 @@ void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
       break;
   }
   
-  tr_current_monitor_ = end_monitor;
   pcc_monitor.loss = loss;
   pcc_monitor.utility = current_utility;
   pcc_monitor.bw = actual_bw;
+  int64_t dl_time = 
+      (pcc_monitor.end_ack_time - pcc_monitor.start_ack_time).ToMicroseconds();
+  pcc_monitor.dl_rate = pcc_monitor.dl_rate * 8 / dl_time;
 
 #ifdef DEBUG_  
   printf("E %2d | st=%d r=%6.3lf pr=%8.2lf gt=%d/nr=%d/cg=%d ",
@@ -638,4 +666,4 @@ UtilityState PCCUtility::GetCurrentState() const {
   return state_;
 }
 
-}  // namespace net
+} // namespace net

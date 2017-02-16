@@ -18,7 +18,7 @@
 #include "net/quic/core/congestion_control/send_algorithm_interface.h"
 #include "net/quic/core/quic_bandwidth.h"
 #include "net/quic/core/quic_connection_stats.h"
-#include "net/quic/core/quic_protocol.h"
+#include "net/quic/core/quic_types.h"
 #include "net/quic/core/quic_time.h"
 
 //#define DEBUG_
@@ -71,6 +71,10 @@ struct PCCMonitor {
   QuicTime start_time;
   QuicTime end_time;
   QuicTime end_transmission_time;
+  
+  QuicTime start_ack_time;
+  QuicTime end_ack_time;
+  double dl_rate;
 
   // packet statics
   QuicPacketNumber start_seq_num;
@@ -78,6 +82,7 @@ struct PCCMonitor {
   std::vector<PacketInfo> packet_vector;
 
   PCCMonitor();
+  PCCMonitor(const PCCMonitor& other);
   ~PCCMonitor();
 };
 
@@ -97,8 +102,6 @@ const int NUMBER_OF_PROBE = 4;
 const int MAX_COUNTINOUS_GUESS = 5;
 const double GRANULARITY = 0.05;
 const double MIN_RATE = 2.0;
-static int tr_current_monitor_ = -1;
-static int tr_last_monitor_ = -1;
 
 class PCCUtility {
  public:
@@ -151,7 +154,7 @@ class RttStats;
 
 class NET_EXPORT_PRIVATE PCCSender : public SendAlgorithmInterface {
  public:
-  PCCSender(const RttStats* rtt_stats);
+  PCCSender(const QuicClock* clock, const RttStats* rtt_stats);
   ~PCCSender() override;
 
   // SendAlgorithmInterface methods.
@@ -163,6 +166,7 @@ class NET_EXPORT_PRIVATE PCCSender : public SendAlgorithmInterface {
   void SetNumEmulatedConnections(int num_connections) override {};
   void OnCongestionEvent(bool rtt_updated,
                          QuicByteCount bytes_in_flight,
+                         QuicTime event_time,
                          const CongestionVector& acked_packets,
                          const CongestionVector& lost_packets) override;
   bool OnPacketSent(QuicTime sent_time,
@@ -177,7 +181,6 @@ class NET_EXPORT_PRIVATE PCCSender : public SendAlgorithmInterface {
       QuicByteCount bytes_in_flight) const override;
   QuicBandwidth PacingRate(QuicByteCount bytes_in_flight) const override;
   QuicBandwidth BandwidthEstimate() const override;
-  QuicTime::Delta RetransmissionDelay() const override;
   QuicByteCount GetCongestionWindow() const override;
   bool InSlowStart() const override;
   bool InRecovery() const override;
@@ -194,8 +197,11 @@ class NET_EXPORT_PRIVATE PCCSender : public SendAlgorithmInterface {
   const QuicTime::Delta alarm_granularity_ =
       QuicTime::Delta::FromMicroseconds(1);
 
+  //const QuicClock* clock_;
+  
   // PCC monitor variable
   MonitorNumber current_monitor_;
+  MonitorNumber last_end_monitor_;
   QuicTime current_monitor_end_time_;
 
   PCCMonitor monitors_[NUM_MONITOR];
