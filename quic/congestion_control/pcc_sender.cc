@@ -114,8 +114,9 @@ void PCCSender::StartMonitor(QuicTime sent_time){
   if (srtt == 0) {srtt = rtt_stats_->initial_rtt_us();}
   
   int64_t mrtt = srtt;
-  int64_t rtt1000 = int64_t(12000000.0 / pcc_utility_.GetCurrentRate());
-  if (rtt1000 < 100000 && srtt > 100000) {mrtt = 100000;}
+  int64_t rtt200 = int64_t(2400000.0 / pcc_utility_.GetCurrentRate());
+  if (rtt200 < 100000 && srtt > 100000) {mrtt = 100000;}
+  if (mrtt > 300000) {mrtt = 300000;}
   
   QuicTime::Delta monitor_interval =
       QuicTime::Delta::FromMicroseconds(mrtt * (1.3 + rand_factor));
