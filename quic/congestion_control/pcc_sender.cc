@@ -61,6 +61,7 @@ PCCSender::PCCSender(const QuicClock* clock, const RttStats* rtt_stats)
 #else
 PCCSender::PCCSender(const QuicClock* clock, const RttStats* rtt_stats)
   : current_monitor_(-1),
+    last_end_monitor_(-1),
     current_monitor_end_time_(QuicTime::Zero()),
     rtt_stats_(rtt_stats),
     ideal_next_packet_send_time_(QuicTime::Zero()) {
@@ -283,28 +284,27 @@ std::string PCCSender::GetDebugState() const {
   if (last_end_monitor_ >= 0) {
     const int tm = last_end_monitor_;
     const PCCMonitor &m = monitors_[tm];
-    if (m.end_time.IsInitialized()) {
-      const PCCUtility &u = pcc_utility_;
-      StrAppend(&msg, "[st=", u.state_, ",");
-      StrAppend(&msg, "pu=", u.previous_utility_, ",");
-      StrAppend(&msg, "(gt=", u.guess_time_, ",");
-      StrAppend(&msg, "nr=", u.num_recorded_, ")");
-      StrAppend(&msg, "(dir=", u.change_direction_, ",");
-      StrAppend(&msg, "ci=", u.change_intense_, ",");
-      StrAppend(&msg, "cm=", (int)current_monitor_, ",");
-      StrAppend(&msg, "tm=", (int)u.target_monitor_, ")] ");
+    
+    const PCCUtility &u = pcc_utility_;
+    StrAppend(&msg, "[st=", u.state_, ",");
+    StrAppend(&msg, "pu=", u.previous_utility_, ",");
+    StrAppend(&msg, "(gt=", u.guess_time_, ",");
+    StrAppend(&msg, "nr=", u.num_recorded_, ")");
+    StrAppend(&msg, "(dir=", u.change_direction_, ",");
+    StrAppend(&msg, "ci=", u.change_intense_, ",");
+    StrAppend(&msg, "cm=", (int)current_monitor_, ",");
+    StrAppend(&msg, "tm=", (int)u.target_monitor_, ")] ");
 
-      int64_t time = 
-        (m.end_transmission_time - m.start_time).ToMicroseconds();
-      int n = m.end_seq_num - m.start_seq_num;
-      StrAppend(&msg, "M", tm, ":");
-      StrAppend(&msg, "r=", m.tx_rate, ",");
-      StrAppend(&msg, m.loss, "/", n);
-      StrAppend(&msg, ",t=", time, ",");
-      StrAppend(&msg, m.srtt, "/", m.ertt);
-      StrAppend(&msg, ",", m.utility, "/");
-      StrAppend(&msg, m.bw, "/", m.dl_rate);
-    }
+    int64_t time = 
+      (m.end_transmission_time - m.start_time).ToMicroseconds();
+    int n = m.end_seq_num - m.start_seq_num;
+    StrAppend(&msg, "M", tm, ":");
+    StrAppend(&msg, "r=", m.tx_rate, ",");
+    StrAppend(&msg, m.loss, "/", n);
+    StrAppend(&msg, ",t=", time, ",");
+    StrAppend(&msg, m.srtt, "/", m.ertt);
+    StrAppend(&msg, ",", m.utility, "/");
+    StrAppend(&msg, m.bw, "/", m.dl_rate);
   }
   return msg;
 }
