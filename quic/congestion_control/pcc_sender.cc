@@ -1,669 +1,360 @@
-/*
- * pcc_sender.cc
- *
- *  Created on: March 28, 2016
- *      Authors:
- *               Xuefeng Zhu (zhuxuefeng1994@126.com)
- *               Mo Dong (modong2@illinois.edu)
- *               Tong Meng (tongm2@illinois.edu)
- */
+#include "third_party/pcc_quic/pcc_sender.h"
+
 #include <stdio.h>
+#include <algorithm>
 
-#include "net/quic/core/congestion_control/pcc_sender.h"
-#include "net/quic/core/congestion_control/rtt_stats.h"
-#include "net/quic/core/quic_time.h"
-#include "base/time/time.h"
+#include "gfe/quic/core/congestion_control/rtt_stats.h"
+#include "gfe/quic/core/quic_time.h"
+#include "gfe/quic/platform/api/quic_str_cat.h"
 
-namespace net {
+namespace gfe_quic {
 
-PCCMonitor::PCCMonitor()
-  : start_time(QuicTime::Zero()),
-    end_time(QuicTime::Zero()),
-    end_transmission_time(QuicTime::Zero()),
-    start_ack_time(QuicTime::Zero()),
-    end_ack_time(QuicTime::Zero()),
-    start_seq_num(-1),
-    end_seq_num(-1) {
+namespace {
+// Minimum sending rate of the connection.
+const float kMinSendingRate = 2.0f;
+// Step size for rate change in PROBING mode.
+const float kProbingStepSize = 0.05f;
+// Base step size for rate change in DECISION_MADE mode.
+const float kDecisionMadeStepSize = 0.02f;
+// Maximum step size for rate change in DECISION_MADE mode.
+const float kMaxDecisionMadeStepSize = 0.10f;
+// Groups of useful monitor intervals each time in PROBING mode.
+const size_t kNumIntervalGroupsInProbing = 2;
+// Number of bits per byte.
+const size_t kBitsPerByte = 8;
+// Number of bits per Mbit.
+const size_t kMegabit = 1024 * 1024;
+// Rtt moving average weight.
+const float kAverageRttWeight = 0.1;
+}  // namespace
+
+PccSender::PccSender(const RttStats* rtt_stats,
+                     QuicPacketCount initial_congestion_window,
+                     QuicPacketCount max_congestion_window,
+                     QuicRandom* random)
+    : mode_(STARTING),
+      latest_utility_(0.0),
+      monitor_duration_(QuicTime::Delta::Zero()),
+      direction_(INCREASE),
+      rounds_(1),
+      interval_queue_(/*delegate=*/this),
+      avg_rtt_(QuicTime::Delta::Zero()),
+      last_rtt_(QuicTime::Delta::Zero()),
+      time_last_rtt_received_(QuicTime::Zero()),
+      max_cwnd_bits_(max_congestion_window * kDefaultTCPMSS * kBitsPerByte),
+      rtt_stats_(rtt_stats),
+      random_(random) {
+  sending_rate_mbps_ =
+      std::max(static_cast<float>(initial_congestion_window * kDefaultTCPMSS *
+                                  kBitsPerByte) /
+                   static_cast<float>(rtt_stats_->initial_rtt_us()),
+               kMinSendingRate);
 }
 
-PCCMonitor::PCCMonitor(const PCCMonitor& other)
-  : state(other.state),
-    tx_rate(other.tx_rate),
-    srtt(other.srtt),
-    ertt(other.ertt),
-    utility(other.utility),
-    bw(other.bw),
-    loss(other.loss),
-    start_time(other.start_time),
-    end_time(other.end_time),
-    end_transmission_time(other.end_transmission_time),
-    start_ack_time(QuicTime::Zero()),
-    end_ack_time(QuicTime::Zero()),
-    start_seq_num(other.start_seq_num),
-    end_seq_num(other.end_seq_num) {
-  packet_vector = other.packet_vector;
-}
+bool PccSender::OnPacketSent(QuicTime sent_time,
+                             QuicByteCount bytes_in_flight,
+                             QuicPacketNumber packet_number,
+                             QuicByteCount bytes,
+                             HasRetransmittableData is_retransmittable) {
+  // Start a new monitor interval if (1) there is no useful interval in the
+  // queue, or (2) it has been more than monitor_duration since the last
+  // interval starts.
+  if (interval_queue_.num_useful_intervals() == 0 ||
+      sent_time - interval_queue_.current().first_packet_sent_time >
+          monitor_duration_) {
+    MaybeSetSendingRate();
+    // Set the monitor duration to be 1.5 of avg_rtt_.
+    monitor_duration_ = 1.5 * avg_rtt_;
 
-PCCMonitor::~PCCMonitor(){
-}
-
-#ifdef DEBUG_
-PCCSender::PCCSender(const QuicClock* clock, const RttStats* rtt_stats)
-  : current_monitor_(-1),
-    last_end_monitor_(-1),
-    current_monitor_end_time_(QuicTime::Zero()),
-    rtt_stats_(rtt_stats),
-    ideal_next_packet_send_time_(QuicTime::Zero()),
-    previous_timer_(QuicTime::Zero()),
-    send_bytes_(0),
-    ack_bytes_(0) {
-}
-#else
-PCCSender::PCCSender(const QuicClock* clock, const RttStats* rtt_stats)
-  : current_monitor_(-1),
-    last_end_monitor_(-1),
-    current_monitor_end_time_(QuicTime::Zero()),
-    rtt_stats_(rtt_stats),
-    ideal_next_packet_send_time_(QuicTime::Zero()) {
-}
-#endif
-
-
-PCCSender::~PCCSender() {}
-
-bool PCCSender::OnPacketSent(
-    QuicTime sent_time,
-    QuicByteCount bytes_in_flight,
-    QuicPacketNumber packet_number,
-    QuicByteCount bytes,
-    HasRetransmittableData has_retransmittable_data) {
-  
-#ifdef DEBUG_
-  if (!previous_timer_.IsInitialized()) {
-    previous_timer_ = sent_time;
+    interval_queue_.EnqueueNewMonitorInterval(
+        sending_rate_mbps_, CreateUsefulInterval(),
+        avg_rtt_.ToMicroseconds());
   }
+  interval_queue_.OnPacketSent(sent_time, packet_number, bytes);
 
-  if ((sent_time - previous_timer_).ToSeconds()) {
-    printf("|_ rtt %6ldus, ", rtt_stats_->smoothed_rtt().ToMicroseconds());
-    printf("sent at rate %6.3f mbps, ", (double)send_bytes_*8 / 1024 / 1024);
-    printf("throughput rate %6.3f mbps\n", (double)ack_bytes_*8 / 1024 / 1024);
-
-    previous_timer_ = sent_time;
-    send_bytes_ = 0;
-    ack_bytes_ = 0;
-  } else {
-    send_bytes_ += bytes;
-  }
-#endif
-
-  // TODO : case for retransmission
-  if (!current_monitor_end_time_.IsInitialized()) {
-    StartMonitor(sent_time);
-    monitors_[current_monitor_].start_seq_num = packet_number;
-    ideal_next_packet_send_time_ = sent_time;
-  } else {
-    QuicTime::Delta diff = sent_time - current_monitor_end_time_;
-    if (diff.ToMicroseconds() > 0 || pcc_utility_.GetEarlyEndFlag()) {
-    //if (diff.ToMicroseconds() > 0) {
-      monitors_[current_monitor_].state = WAITING;
-      monitors_[current_monitor_].end_transmission_time = sent_time;
-      monitors_[current_monitor_].end_seq_num = packet_number;
-      current_monitor_end_time_ = QuicTime::Zero();
-      pcc_utility_.SetEarlyEndFlag(false);
-    }
-  }
-  PacketInfo packet_info;
-  packet_info.sent_time = sent_time;
-  packet_info.bytes = bytes;
-  monitors_[current_monitor_].packet_vector.push_back(packet_info);
-  QuicTime::Delta delay = QuicTime::Delta::FromMicroseconds(
-      bytes * 8 * base::Time::kMicrosecondsPerSecond /
-    pcc_utility_.GetCurrentRate() / 1024 / 1024);
-  ideal_next_packet_send_time_ = ideal_next_packet_send_time_ + delay;
   return true;
 }
 
-void PCCSender::StartMonitor(QuicTime sent_time){
-  current_monitor_ = (current_monitor_ + 1) % NUM_MONITOR;
-  pcc_utility_.OnMonitorStart(current_monitor_);
-
-  // calculate monitor interval and monitor end time
-  double rand_factor = 0.1 + (double(rand() % 3) / 10);
-  //int64_t srtt = rtt_stats_->latest_rtt().ToMicroseconds();
-  int64_t srtt = rtt_stats_->smoothed_rtt().ToMicroseconds();
-  if (srtt == 0) {srtt = rtt_stats_->initial_rtt_us();}
-  
-  int64_t mrtt = srtt;
-  int64_t rtt200 = int64_t(2400000.0 / pcc_utility_.GetCurrentRate());
-  if (rtt200 < 100000 && srtt > 100000) {mrtt = 100000;}
-  if (mrtt > 300000) {mrtt = 300000;}
-  
-  QuicTime::Delta monitor_interval =
-      QuicTime::Delta::FromMicroseconds(mrtt * (1.3 + rand_factor));
-  // TODO: restrict maximum MI duration
-  current_monitor_end_time_ = sent_time + monitor_interval;
-
-  monitors_[current_monitor_].state = SENDING;
-  monitors_[current_monitor_].tx_rate = pcc_utility_.GetCurrentRate();
-  monitors_[current_monitor_].srtt = srtt;
-  monitors_[current_monitor_].ertt = 0;
-  monitors_[current_monitor_].start_time = sent_time;
-  monitors_[current_monitor_].end_time = QuicTime::Zero();
-  monitors_[current_monitor_].end_transmission_time = QuicTime::Zero();
-  monitors_[current_monitor_].start_ack_time = QuicTime::Zero();
-  monitors_[current_monitor_].end_ack_time = QuicTime::Zero();
-  monitors_[current_monitor_].end_seq_num = -1;
-  monitors_[current_monitor_].packet_vector.clear();
-
-}
-
-void PCCSender::OnCongestionEvent(
-    bool rtt_updated,
-    QuicByteCount bytes_in_flight,
-    QuicTime event_time,
-    const CongestionVector& acked_packets,
-    const CongestionVector& lost_packets) {
-  for (CongestionVector::const_iterator it = lost_packets.cbegin();
-      it != lost_packets.cend(); ++it) {
-    MonitorNumber monitor_num = GetMonitor(it->first);
-    if (monitor_num == -1) {
-      continue;
-    }
-    int pos = it->first - monitors_[monitor_num].start_seq_num;
-    monitors_[monitor_num].packet_vector[pos].state = LOST;
-
-    if (it->first == monitors_[monitor_num].end_seq_num) {
-      EndMonitor(monitor_num);
+void PccSender::OnCongestionEvent(bool rtt_updated,
+                                  QuicByteCount bytes_in_flight,
+                                  QuicTime event_time,
+                                  const CongestionVector& acked_packets,
+                                  const CongestionVector& lost_packets) {
+  if (avg_rtt_.IsZero()) {
+    avg_rtt_ = rtt_stats_->latest_rtt();
+  } else {
+    // Ideal packet interval under pacing should be (packet_size/sending_rate).
+    // Considering delayed ACK and Nagle's algorithm in practice, each ACK
+    // usually acknowledges at least two packets. Thus, we conservatively use
+    // that value as the threshold to detect ack aggregation.
+    QuicTime::Delta ack_aggregation_threshold =
+        QuicTime::Delta::FromMicroseconds(kMaxPacketSize * kBitsPerByte /
+                                          sending_rate_mbps_);
+    if (event_time - time_last_rtt_received_ > ack_aggregation_threshold) {
+      avg_rtt_ = (1 - kAverageRttWeight) * avg_rtt_ +
+                    kAverageRttWeight * last_rtt_;
     }
   }
+  last_rtt_ = rtt_stats_->latest_rtt();
+  time_last_rtt_received_ = event_time;
 
-  for (CongestionVector::const_iterator it = acked_packets.cbegin();
-      it != acked_packets.cend(); ++it) {
-
-    MonitorNumber monitor_num = GetMonitor(it->first);
-    if (monitor_num == -1) {
-      continue;
-    }
-    int pos = it->first - monitors_[monitor_num].start_seq_num;
-    monitors_[monitor_num].packet_vector[pos].state = ACK;
-    
-    if (!monitors_[monitor_num].start_ack_time.IsInitialized()) {
-      monitors_[monitor_num].start_ack_time = event_time;
-    }
-    monitors_[monitor_num].end_ack_time = event_time;
-    monitors_[monitor_num].dl_rate += // FIXME
-        monitors_[monitor_num].packet_vector[pos].bytes;
-    
-#ifdef DEBUG_
-    ack_bytes_ += monitors_[monitor_num].packet_vector[pos].bytes;
-#endif
-
-    if (it->first == monitors_[monitor_num].end_seq_num) {
-      EndMonitor(monitor_num);
-    }
-  }
+  interval_queue_.OnCongestionEvent(acked_packets, lost_packets,
+                                    avg_rtt_.ToMicroseconds());
 }
 
-void PCCSender::EndMonitor(MonitorNumber monitor_num) {
-  if (monitors_[monitor_num].state == WAITING){
-    monitors_[monitor_num].state = FINISHED;
-    monitors_[monitor_num].ertt = rtt_stats_->smoothed_rtt().ToMicroseconds();
-    pcc_utility_.OnMonitorEnd(monitors_[monitor_num], current_monitor_,
-                              monitor_num);
-    last_end_monitor_ = monitor_num;
-  }
-}
-
-MonitorNumber PCCSender::GetMonitor(QuicPacketNumber sequence_number) {
-  MonitorNumber result = current_monitor_;
-
-  do {
-    int diff = sequence_number - monitors_[result].start_seq_num;
-    if (diff >= 0 && diff < (int)monitors_[result].packet_vector.size()) {
-      return result;
-    }
-
-    result = (result + 99) % NUM_MONITOR;
-  } while (result != current_monitor_);
-
-#ifdef DEBIG_
-  printf("Monitor is not found\n");
-#endif
-  return -1;
-}
-
-QuicTime::Delta PCCSender::TimeUntilSend(
-      QuicTime now,
-      QuicByteCount bytes_in_flight) const {
-    // If the next send time is within the alarm granularity, send immediately.
-  if (ideal_next_packet_send_time_ > now + alarm_granularity_) {
-    QuicTime::Delta packet_delay = ideal_next_packet_send_time_ - now;
-    DVLOG(1) << "Delaying packet: "
-             << packet_delay.ToMicroseconds();
-    return packet_delay;
-  }
-
-  DVLOG(1) << "Sending packet now";
+QuicTime::Delta PccSender::TimeUntilSend(QuicTime now,
+                                         QuicByteCount bytes_in_flight) {
   return QuicTime::Delta::Zero();
 }
 
-QuicBandwidth PCCSender::PacingRate(QuicByteCount bytes_in_flight) const {
+QuicBandwidth PccSender::PacingRate(QuicByteCount bytes_in_flight) const {
+  return QuicBandwidth::FromBitsPerSecond(
+      static_cast<int64_t>(sending_rate_mbps_ * kMegabit));
+}
+
+QuicBandwidth PccSender::BandwidthEstimate() const {
   return QuicBandwidth::Zero();
 }
 
-QuicBandwidth PCCSender::BandwidthEstimate() const {
-  return QuicBandwidth::Zero();
+QuicByteCount PccSender::GetCongestionWindow() const {
+  // Use avg_rtt_ to calculate expected congestion window except when it
+  // equals 0, which happens when the connection just starts.
+  int64_t rtt_us = avg_rtt_.IsZero()
+                   ? rtt_stats_->initial_rtt_us()
+                   : avg_rtt_.ToMicroseconds();
+  return static_cast<QuicByteCount>(sending_rate_mbps_ * rtt_us / kBitsPerByte);
 }
 
-QuicByteCount PCCSender::GetCongestionWindow() const {
-  QuicByteCount pcc_utility_rate = (QuicByteCount)pcc_utility_.GetCurrentRate();
-  QuicByteCount pcc_utility_state = (QuicByteCount)pcc_utility_.GetCurrentState();
+bool PccSender::InSlowStart() const { return false; }
 
-  return pcc_utility_rate << 32 | pcc_utility_state;
+bool PccSender::InRecovery() const { return false; }
+
+QuicByteCount PccSender::GetSlowStartThreshold() const { return 0; }
+
+CongestionControlType PccSender::GetCongestionControlType() const {
+  return kPCC;
 }
 
-bool PCCSender::InSlowStart() const {
-  return false;
-}
-
-bool PCCSender::InRecovery() const {
-  return false;
-}
-
-QuicByteCount PCCSender::GetSlowStartThreshold() const {
-  return 1000*kMaxPacketSize;
-}
-
-CongestionControlType PCCSender::GetCongestionControlType() const {
-  return kPcc;
-}
-
-std::string PCCSender::GetDebugState() const {
-  std::string msg;
-  
-  if (last_end_monitor_ >= 0) {
-    const int tm = last_end_monitor_;
-    const PCCMonitor &m = monitors_[tm];
-    
-    const PCCUtility &u = pcc_utility_;
-    StrAppend(&msg, "[st=", u.state_, ",");
-    StrAppend(&msg, "pu=", u.previous_utility_, ",");
-    StrAppend(&msg, "(gt=", u.guess_time_, ",");
-    StrAppend(&msg, "nr=", u.num_recorded_, ")");
-    StrAppend(&msg, "(dir=", u.change_direction_, ",");
-    StrAppend(&msg, "ci=", u.change_intense_, ",");
-    StrAppend(&msg, "cm=", (int)current_monitor_, ",");
-    StrAppend(&msg, "tm=", (int)u.target_monitor_, ")] ");
-
-    int64_t time = 
-      (m.end_transmission_time - m.start_time).ToMicroseconds();
-    int n = m.end_seq_num - m.start_seq_num;
-    StrAppend(&msg, "M", tm, ":");
-    StrAppend(&msg, "r=", m.tx_rate, ",");
-    StrAppend(&msg, m.loss, "/", n);
-    StrAppend(&msg, ",t=", time, ",");
-    StrAppend(&msg, m.srtt, "/", m.ertt);
-    StrAppend(&msg, ",", m.utility, "/");
-    StrAppend(&msg, m.bw, "/", m.dl_rate);
+string PccSender::GetDebugState() const {
+  if (interval_queue_.empty()) {
+    return "pcc??";
   }
+
+  const MonitorInterval& mi = interval_queue_.current();
+  std::string msg = QuicStrCat(
+      "[st=", mode_, ",", "r=", sending_rate_mbps_, ",", "pu=", latest_utility_,
+      ",", "dir=", direction_, ",", "round=", rounds_, ",",
+      "num=", interval_queue_.num_useful_intervals(), ")",
+      "[r=", mi.sending_rate_mbps, ",", "use=", mi.is_useful, ",", "(",
+      mi.first_packet_sent_time.ToDebuggingValue(), "-", ">",
+      mi.last_packet_sent_time.ToDebuggingValue(), ")", "(",
+      mi.first_packet_number, "-", ">", mi.last_packet_number, ")", "(",
+      mi.bytes_total, "/", mi.bytes_acked, "/", mi.bytes_lost, ")", "(",
+      mi.rtt_on_monitor_start_us, "-", ">", mi.rtt_on_monitor_end_us, ")");
   return msg;
 }
 
-PCCUtility::PCCUtility()
-  : state_(STARTING),
-    current_rate_(MIN_RATE),
-    waiting_rate_(MIN_RATE),
-    probing_rate_(MIN_RATE),
-    target_monitor_(1),
-    current_monitor_early_end_(false),
-    previous_utility_(0),
-    loss_ignorance_count_(70000),
-    guess_time_(0),
-    num_recorded_(0),
-    continuous_guess_count_(0),
-    change_direction_(0),
-    change_intense_(1) {
-  }
-
-void PCCUtility::OnMonitorStart(MonitorNumber current_monitor) {
-  UtilityState old_state;
-  do {
-    old_state = state_;
-    switch (state_) {
-      case STARTING:
-        if (current_monitor != target_monitor_) {
-          current_rate_ = waiting_rate_;
-        }
-        break;
-      case GUESSING:
-        if (continuous_guess_count_ == MAX_COUNTINOUS_GUESS) {
-          // current_rate_ *= (1 - GRANULARITY);
-          continuous_guess_count_ = 0;
-        }
-
-        state_ = RECORDING;
-        continuous_guess_count_++;
-
-        for (int i = 0; i < NUMBER_OF_PROBE; i += 2) {
-          int rand_dir = rand() % 2 * 2 - 1;
-
-          guess_stat_bucket[i].rate = current_rate_
-              + rand_dir * GRANULARITY * current_rate_;
-          guess_stat_bucket[i + 1].rate = current_rate_
-              - rand_dir * GRANULARITY * current_rate_;
-        }
-
-        for (int i = 0; i < NUMBER_OF_PROBE; i++) {
-          guess_stat_bucket[i].monitor = (current_monitor + i) % NUM_MONITOR;
-        }
-        guess_time_ = 0;
-        break;
-      case RECORDING:
-        if (guess_time_ != -1) {
-          current_rate_ = guess_stat_bucket[guess_time_].rate;
-          guess_time_++;
-
-          if (guess_time_ == NUMBER_OF_PROBE) {
-            guess_time_ = -1;
-          }
-        } else {
-          current_rate_ = (guess_stat_bucket[0].rate < guess_stat_bucket[1].rate) ? 
-                        guess_stat_bucket[0].rate : guess_stat_bucket[1].rate;
-        }
-        break;
-      case MOVING:
-        if(current_monitor != target_monitor_) {
-          current_rate_ = waiting_rate_;
-        }
-        break;
-     default:
-        LOG(FATAL) << "unhandled switch.  old_state = "
-                   << old_state << " and state = " << state_;
-        break;
-    }
-  } while (old_state != state_);
-
-#ifdef DEBUG_
-  printf("S %2d | st=%d r=%6.3lf gt=%d/nr=%d/cg=%d ",
-      current_monitor, state_, current_rate_,
-      guess_time_, num_recorded_, continuous_guess_count_);
-  printf("dir=%d/ci=%d/tm=%2d\n",
-      change_direction_, change_intense_, (int)target_monitor_);
-#endif
-}
-
-void PCCUtility::OnMonitorEnd(PCCMonitor pcc_monitor,
-                              MonitorNumber current_monitor,
-                              MonitorNumber end_monitor) {
-
-  double total = 0;
-  double loss = 0;
-  GetBytesSum(pcc_monitor.packet_vector, total, loss);
-
-  int64_t time = 
-      (pcc_monitor.end_transmission_time - pcc_monitor.start_time).ToMicroseconds();
-
-  double rtt_ratio = 1.0 * pcc_monitor.srtt / pcc_monitor.ertt;
-
-  double current_utility = ((total - loss) / time *
-    (1 - 1 / (1 + exp(-1000 * (loss / total - 0.05)))) *
-    (1 - 1 / (1 + exp(-10 * (1 - rtt_ratio)))) - loss / time) * 1000;
-#ifdef DEBUG_
-  double current_utility_nonlatency = ((total - loss) / time *
-    (1 - 1 / ( 1 + exp(-1000 * (loss / total - 0.05)))) * 0.5
-    - loss / time) * 1000;
-  double actual_tx_rate = total * 8 / time;
-#endif
-
-  double actual_bw = pcc_monitor.tx_rate * time * 1.0 /
-                  (time + pcc_monitor.ertt - pcc_monitor.srtt);
-  
-  switch (state_) {
+void PccSender::OnUtilityAvailable(
+    const std::vector<UtilityInfo>& utility_info) {
+  switch (mode_) {
     case STARTING:
-      {
-      if (loss_ignorance_count_ > 0) {
-        if (loss_ignorance_count_ >= loss) {
-          loss_ignorance_count_ -= loss;
-          loss = 0;
-        } else {
-          loss -= loss_ignorance_count_;
-          loss_ignorance_count_ = 0;
-        }
-        
-        if (rtt_ratio > 0.7) {
-          current_utility = ((total - loss) / time *
-                          (1 - 1 / (1 + exp(-1000 * (loss / total - 0.05)))) * 0.5
-                          - loss / time) * 1000;
-        }
-      }
-      
-      if (end_monitor == target_monitor_) {
-        if (current_utility > previous_utility_) {
-          waiting_rate_ = probing_rate_;
-          current_rate_ = probing_rate_ * 2;
-          probing_rate_ = current_rate_;
-          
-          target_monitor_ = (current_monitor + 1) % NUM_MONITOR;
-        } else {
-          state_ = GUESSING;
-          current_rate_ = actual_bw * (1 - GRANULARITY);
-          if (current_rate_ < MIN_RATE) {current_rate_ = MIN_RATE;}
-          probing_rate_ = current_rate_;
-          if (waiting_rate_ > current_rate_) {
-            waiting_rate_ = current_rate_;
-          }
-        }
-        
-        previous_utility_ = current_utility;
-        current_monitor_early_end_ = true;
+      DCHECK_EQ(1u, utility_info.size());
+      if (utility_info[0].utility > latest_utility_) {
+        // Stay in STARTING mode. Double the sending rate and update
+        // latest_utility.
+        sending_rate_mbps_ *= 2;
+        latest_utility_ = utility_info[0].utility;
+        ++rounds_;
+      } else {
+        // Enter PROBING mode if utility decreases.
+        EnterProbing();
       }
       break;
+    case PROBING:
+      if (CanMakeDecision(utility_info)) {
+        // Enter DECISION_MADE mode if a decision is made.
+        direction_ = (utility_info[0].utility > utility_info[1].utility)
+                         ? ((utility_info[0].sending_rate_mbps >
+                             utility_info[1].sending_rate_mbps)
+                                ? INCREASE
+                                : DECREASE)
+                         : ((utility_info[0].sending_rate_mbps >
+                             utility_info[1].sending_rate_mbps)
+                                ? DECREASE
+                                : INCREASE);
+        latest_utility_ =
+            std::max(utility_info[2 * kNumIntervalGroupsInProbing - 2].utility,
+                     utility_info[2 * kNumIntervalGroupsInProbing - 1].utility);
+        EnterDecisionMade();
+      } else {
+        // Stays in PROBING mode.
+        EnterProbing();
       }
-    case RECORDING:
-      {
-      // find corresponding monitor
-      for (int i = 0; i < NUMBER_OF_PROBE; i++) {
-        if (end_monitor == guess_stat_bucket[i].monitor) {
-          num_recorded_++;
-          guess_stat_bucket[i].utility = current_utility;
-          guess_stat_bucket[i].total = total;
-          guess_stat_bucket[i].loss = loss;
-          guess_stat_bucket[i].srtt = pcc_monitor.srtt;
-          guess_stat_bucket[i].ertt = pcc_monitor.ertt;
-          guess_stat_bucket[i].bw = actual_bw;
-          break;
-        }
-      }
-
-      if (num_recorded_ == NUMBER_OF_PROBE) {
-        num_recorded_ = 0;
-        int decision = 0;
-
-        for (int i = 0; i < NUMBER_OF_PROBE; i += 2) {
-          bool case1 = guess_stat_bucket[i].utility > guess_stat_bucket[i + 1].utility
-              && guess_stat_bucket[i].rate > guess_stat_bucket[i + 1].rate;
-          bool case2 = guess_stat_bucket[i].utility < guess_stat_bucket[i + 1].utility
-              && guess_stat_bucket[i].rate < guess_stat_bucket[i + 1].rate;
-
-          decision += case1 || case2 ? 1 : -1;
-        }
-        
-        double sum_total = 0, sum_loss = 0, avg_loss_rate;
-        double avg_ratio = 0;
-        double sample_ratio = guess_stat_bucket[0].srtt /
-                            guess_stat_bucket[NUMBER_OF_PROBE-1].ertt;
-        double avg_bw = 0;
-        for (int i = 0; i < NUMBER_OF_PROBE; i ++) {
-          sum_total += guess_stat_bucket[i].total;
-          sum_loss += guess_stat_bucket[i].loss;
-          
-          avg_ratio += (1.0 * guess_stat_bucket[i].srtt / guess_stat_bucket[i].ertt);
-          avg_bw += guess_stat_bucket[i].bw;
-        }
-        avg_loss_rate = sum_loss / sum_total;
-        avg_ratio /= NUMBER_OF_PROBE;
-        avg_bw /= NUMBER_OF_PROBE;
-        if (avg_ratio < 0.8 || sample_ratio < 0.66) {
-          decision = -6;
-        } else if (sum_total > 500 && avg_loss_rate > 0.05) {
-          decision = -2;
-        }
-
-        if (decision == -6) {
-          current_rate_ = avg_bw * (1 - 1.5 * GRANULARITY);
-          if (current_rate_ < MIN_RATE) {current_rate_ = MIN_RATE;}
-          state_ = GUESSING;
-        } else if (decision == 0) {
-          current_rate_ = (guess_stat_bucket[0].rate + guess_stat_bucket[1].rate) / 2;
-          state_ = GUESSING;
+      break;
+    case DECISION_MADE:
+      DCHECK_EQ(1u, utility_info.size());
+      if (utility_info[0].utility > latest_utility_) {
+        // Remain in DECISION_MADE mode. Keep increasing or decreasing the
+        // sending rate.
+        ++rounds_;
+        if (direction_ == INCREASE) {
+          sending_rate_mbps_ *= (1 + std::min(rounds_ * kDecisionMadeStepSize,
+                                              kMaxDecisionMadeStepSize));
         } else {
-          state_ = MOVING;
-          change_direction_ = decision > 0 ? 1 : -1;
-          change_intense_ = 1;
-          
-          double rate1 = guess_stat_bucket[2].rate;
-          double rate2 = guess_stat_bucket[3].rate;
-          double tmp_rate = (change_direction_*(rate1 - rate2) > 0) ? rate1 : rate2;
-          
-          double utility1 = guess_stat_bucket[2].utility;
-          double utility2 = guess_stat_bucket[3].utility;
-          previous_utility_ = (utility1 > utility2) ? utility1 : utility2;
-          
-          double change_amount = change_direction_* GRANULARITY * tmp_rate;
-          if(change_amount > 0 && previous_utility_ < 0) {
-            change_amount = 0.0;
-          }
-          current_rate_ = tmp_rate + change_amount;
-          if (current_rate_ < MIN_RATE) {current_rate_ = MIN_RATE;}
-          probing_rate_ = current_rate_;
-          if(change_direction_ > 0) {
-            waiting_rate_ = tmp_rate;
-          } else {
-            waiting_rate_ = current_rate_;
-          }
-          
-          continuous_guess_count_ = 0;
-          target_monitor_ = (current_monitor + 1) % NUM_MONITOR;
+          sending_rate_mbps_ *= (1 - std::min(rounds_ * kDecisionMadeStepSize,
+                                              kMaxDecisionMadeStepSize));
         }
-        current_monitor_early_end_ = true;
+        latest_utility_ = utility_info[0].utility;
+      } else {
+        // Enter PROBING mode if utility decreases.
+        EnterProbing();
       }
-      break;
-      }
-    case MOVING:
-      {
-      if (end_monitor == target_monitor_) {
-        if (rtt_ratio > 0.95 && rtt_ratio < 1.05) {
-          current_utility = ((total - loss) / time *
-              (1 - 1 / (1 + exp(-1000*(loss/total - 0.05)))) * 0.5 - loss/time) * 1000;
-        }
-      
-        bool continue_moving = current_utility > previous_utility_;
-        if (continue_moving) {
-          if (change_direction_ < 0 || current_utility > 0) {
-            change_intense_ += 1;
-          }
-          target_monitor_ = (current_monitor + 1) % NUM_MONITOR;
-        }
-
-        double change_amount =
-            change_intense_ * GRANULARITY * probing_rate_ * change_direction_;
-        if (current_utility < 0 && change_direction_ > 0 && continue_moving) {
-          change_amount = 0.0;
-        } else if (change_direction_ < 0 && loss == 0 && continue_moving) {
-          change_amount = 0.0;
-          continue_moving = false;
-        } else if (change_amount > 0.1 * probing_rate_) {
-          change_amount = 0.1 * probing_rate_;
-        } else if (change_amount < -0.15 * probing_rate_) {
-          change_amount = -0.15 * probing_rate_;
-        }
-
-        if (rtt_ratio < 0.7) { //FIXME
-          if (change_amount > 0) {
-            current_rate_ = probing_rate_ - change_amount * 1.5;
-          } else {
-            current_rate_ = probing_rate_ + change_amount * 1.5;
-          }
-          if (actual_bw < current_rate_) {current_rate_ = actual_bw;}
-          if (current_rate_ < MIN_RATE) {current_rate_ = MIN_RATE;}
-          
-          if (continue_moving && change_direction_ < 0) {
-            probing_rate_ = waiting_rate_ = current_rate_;
-          } else {
-            state_ = GUESSING;
-          }
-        } else if (continue_moving) {
-          current_rate_ = probing_rate_ + change_amount;
-          if (current_rate_ < MIN_RATE) {current_rate_ = MIN_RATE;}
-          if(change_direction_ > 0) {
-            waiting_rate_ = probing_rate_;
-          } else {
-            waiting_rate_ = current_rate_;
-          }
-          probing_rate_ = current_rate_;
-        } else {
-          // FIXME: use which rate when entering guessing?
-          current_rate_ = probing_rate_ - change_amount;
-          if (current_rate_ < MIN_RATE) {current_rate_ = MIN_RATE;}
-          state_ = GUESSING;
-        }
-        previous_utility_ = current_utility;
-        current_monitor_early_end_ = true;
-      }
-      break;
-      }
-    case GUESSING:
-      break;
-    default:
       break;
   }
-  
-  pcc_monitor.loss = loss;
-  pcc_monitor.utility = current_utility;
-  pcc_monitor.bw = actual_bw;
-  int64_t dl_time = 
-      (pcc_monitor.end_ack_time - pcc_monitor.start_ack_time).ToMicroseconds();
-  pcc_monitor.dl_rate = pcc_monitor.dl_rate * 8 / dl_time;
-
-#ifdef DEBUG_  
-  printf("E %2d | st=%d r=%6.3lf pr=%8.2lf gt=%d/nr=%d/cg=%d ",
-      end_monitor, state_, current_rate_, previous_utility_,
-      guess_time_, num_recorded_, continuous_guess_count_);
-  printf("dir=%d/ci=%d/tm=%2d | %8.2lf/%9.2lf %.0lf/%.0lf %6ld/%6ld/%6ld ",
-      change_direction_, change_intense_, (int)target_monitor_,
-      current_utility, current_utility_nonlatency, total, loss,
-      time, pcc_monitor.srtt, pcc_monitor.ertt);
-  printf("%6.2lf/%6.2lf \n", actual_tx_rate, actual_bw);
-#endif
 }
 
-void PCCUtility::GetBytesSum(std::vector<PacketInfo> packet_vector,
-                                      double& total,
-                                      double& lost) {
-  for (std::vector<PacketInfo>::iterator it = packet_vector.begin();
-      it != packet_vector.end(); ++it) {
-    total += it->bytes;
+bool PccSender::CreateUsefulInterval() const {
+  if (avg_rtt_.IsZero()) {
+    // Create non useful intervals upon starting a connection, until there is
+    // valid rtt stats.
+    QUIC_BUG_IF(mode_ != STARTING);
+    return false;
+  }
+  // In STARTING and DECISION_MADE mode, there should be at most one useful
+  // intervals in the queue; while in PROBING mode, there should be at most
+  // 2 * kNumIntervalGroupsInProbing.
+  size_t max_num_useful =
+      (mode_ == PROBING) ? 2 * kNumIntervalGroupsInProbing : 1;
+  return interval_queue_.num_useful_intervals() < max_num_useful;
+}
 
-    if (it->state == LOST){
-      lost += it->bytes;
+void PccSender::MaybeSetSendingRate() {
+  if (mode_ != PROBING || (interval_queue_.num_useful_intervals() ==
+                               2 * kNumIntervalGroupsInProbing &&
+                           !interval_queue_.current().is_useful)) {
+    // Do not change sending rate when (1) current mode is STARTING or
+    // DECISION_MADE (since sending rate is already changed in
+    // OnUtilityAvailable), or (2) more than 2 * kNumIntervalGroupsInProbing
+    // intervals have been created in PROBING mode.
+    return;
+  }
+
+  if (interval_queue_.num_useful_intervals() != 0) {
+    // Restore central sending rate.
+    if (direction_ == INCREASE) {
+      sending_rate_mbps_ /= (1 + kProbingStepSize);
+    } else {
+      sending_rate_mbps_ /= (1 - kProbingStepSize);
+    }
+
+    if (interval_queue_.num_useful_intervals() ==
+        2 * kNumIntervalGroupsInProbing) {
+      // This is the first not useful monitor interval, its sending rate is the
+      // central rate.
+      return;
     }
   }
+
+  // Sender creates several groups of monitor intervals. Each group comprises an
+  // interval with increased sending rate and an interval with decreased sending
+  // rate. Which interval goes first is randomly decided.
+  if (interval_queue_.num_useful_intervals() % 2 == 0) {
+    direction_ = (random_->RandUint64() % 2 == 1) ? INCREASE : DECREASE;
+  } else {
+    direction_ = (direction_ == INCREASE) ? DECREASE : INCREASE;
+  }
+  if (direction_ == INCREASE) {
+    sending_rate_mbps_ *= (1 + kProbingStepSize);
+  } else {
+    sending_rate_mbps_ *= (1 - kProbingStepSize);
+  }
 }
 
-double PCCUtility::GetCurrentRate() const {
-  return current_rate_;
+bool PccSender::CanMakeDecision(
+    const std::vector<UtilityInfo>& utility_info) const {
+  // Determine whether increased or decreased probing rate has better utility.
+  // Cannot make decision if number of utilities are less than
+  // 2 * kNumIntervalGroupsInProbing. This happens when sender does not have
+  // enough data to send.
+  if (utility_info.size() < 2 * kNumIntervalGroupsInProbing) {
+    return false;
+  }
+
+  bool increase = false;
+  // All the probing groups should have consistent decision. If not, directly
+  // return false.
+  for (size_t i = 0; i < kNumIntervalGroupsInProbing; ++i) {
+    bool increase_i =
+        utility_info[2 * i].utility > utility_info[2 * i + 1].utility
+            ? utility_info[2 * i].sending_rate_mbps >
+                  utility_info[2 * i + 1].sending_rate_mbps
+            : utility_info[2 * i].sending_rate_mbps <
+                  utility_info[2 * i + 1].sending_rate_mbps;
+
+    if (i == 0) {
+      increase = increase_i;
+    }
+    // Cannot make decision if groups have inconsistent results.
+    if (increase_i != increase) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
-bool PCCUtility::GetEarlyEndFlag() const {
-  return current_monitor_early_end_;
+void PccSender::EnterProbing() {
+  switch (mode_) {
+    case STARTING:
+      // Use half sending_rate_ as central probing rate.
+      sending_rate_mbps_ /= 2;
+      break;
+    case DECISION_MADE:
+      // Use sending rate right before utility decreases as central probing
+      // rate.
+      if (direction_ == INCREASE) {
+        sending_rate_mbps_ /= (1 + std::min(rounds_ * kDecisionMadeStepSize,
+                                            kMaxDecisionMadeStepSize));
+      } else {
+        sending_rate_mbps_ /= (1 - std::min(rounds_ * kDecisionMadeStepSize,
+                                            kMaxDecisionMadeStepSize));
+      }
+      break;
+    case PROBING:
+      // Reset sending rate to central rate when sender does not have enough
+      // data to send more than 2 * kNumIntervalGroupsInProbing intervals.
+      if (interval_queue_.current().is_useful) {
+        if (direction_ == INCREASE) {
+          sending_rate_mbps_ /= (1 + kProbingStepSize);
+        } else {
+          sending_rate_mbps_ /= (1 - kProbingStepSize);
+        }
+      }
+      break;
+  }
+
+  if (mode_ == PROBING) {
+    ++rounds_;
+    return;
+  }
+
+  mode_ = PROBING;
+  rounds_ = 1;
 }
 
-void PCCUtility::SetEarlyEndFlag(bool newFlag) {
-  current_monitor_early_end_ = newFlag;
+void PccSender::EnterDecisionMade() {
+  DCHECK_EQ(PROBING, mode_);
+
+  // Change sending rate from central rate based on the probing rate with higher
+  // utility.
+  if (direction_ == INCREASE) {
+    sending_rate_mbps_ *= (1 + kProbingStepSize) * (1 + kDecisionMadeStepSize);
+  } else {
+    sending_rate_mbps_ *= (1 - kProbingStepSize) * (1 - kDecisionMadeStepSize);
+  }
+
+  mode_ = DECISION_MADE;
+  rounds_ = 1;
 }
 
-UtilityState PCCUtility::GetCurrentState() const {
-  return state_;
-}
-
-} // namespace net
+}  // namespace gfe_quic

@@ -1,169 +1,74 @@
-/*
- * pcc_sender.h
- *
- *  Created on: March 28, 2016
- *      Authors:
- *               Xuefeng Zhu (zhuxuefeng1994@126.com)
- *               Mo Dong (modong2@illinois.edu)
- *               Tong Meng (tongm2@illinois.edu)
- */
+// PCC (Performance Oriented Congestion Control) algorithm
+
 #ifndef NET_QUIC_CORE_CONGESTION_CONTROL_PCC_SENDER_H_
 #define NET_QUIC_CORE_CONGESTION_CONTROL_PCC_SENDER_H_
 
-# include <vector>
+#include "third_party/pcc_quic/pcc_monitor_interval_queue.h"
 
-#include "base/basictypes.h"
-#include "base/compiler_specific.h"
-#include "net/base/net_export.h"
-#include "net/quic/core/congestion_control/send_algorithm_interface.h"
-#include "net/quic/core/quic_bandwidth.h"
-#include "net/quic/core/quic_connection_stats.h"
-#include "net/quic/core/quic_types.h"
-#include "net/quic/core/quic_time.h"
+#include <vector>
 
-//#define DEBUG_
+#include "base/macros.h"
+#include "gfe/quic/core/congestion_control/send_algorithm_interface.h"
+#include "gfe/quic/core/quic_bandwidth.h"
+#include "gfe/quic/core/quic_connection_stats.h"
+#include "gfe/quic/core/quic_time.h"
+#include "gfe/quic/core/quic_types.h"
 
-namespace net {
-typedef int MonitorNumber;
+namespace gfe_quic {
 
-enum MonitorState {
-  SENDING,
-  WAITING,
-  FINISHED
-};
-
-enum PacketState {
-  UNACK,
-  ACK,
-  LOST
-};
-
-enum UtilityState {
-  STARTING = 0,
-  GUESSING,
-  RECORDING,
-  MOVING
-};
-
-struct PacketInfo {
-  QuicTime sent_time;
-  QuicByteCount bytes;
-  PacketState state;
-
-  PacketInfo()
-  : sent_time(QuicTime::Zero()),
-    bytes(0),
-    state(UNACK){
-
-    }
-};
-
-struct PCCMonitor {
-  MonitorState state;
-  double tx_rate;
-  int64_t srtt;
-  int64_t ertt;
-  double utility;
-  double bw;
-  double loss;
-
-  // time statics
-  QuicTime start_time;
-  QuicTime end_time;
-  QuicTime end_transmission_time;
-  
-  QuicTime start_ack_time;
-  QuicTime end_ack_time;
-  double dl_rate;
-
-  // packet statics
-  QuicPacketNumber start_seq_num;
-  QuicPacketNumber end_seq_num;
-  std::vector<PacketInfo> packet_vector;
-
-  PCCMonitor();
-  PCCMonitor(const PCCMonitor& other);
-  ~PCCMonitor();
-};
-
-struct GuessStat {
-  MonitorNumber monitor;
-  double rate;
-  double utility;
-  double total;
-  double loss;
-  int64_t srtt;
-  int64_t ertt;
-  double bw;
-};
-
-const int NUM_MONITOR = 100;
-const int NUMBER_OF_PROBE = 4;
-const int MAX_COUNTINOUS_GUESS = 5;
-const double GRANULARITY = 0.05;
-const double MIN_RATE = 2.0;
-
-class PCCUtility {
- public:
-  PCCUtility();
-  // Callback function when monitor starts
-  void OnMonitorStart(MonitorNumber current_monitor);
-
-  // Callback function when monitor ends
-  void OnMonitorEnd(PCCMonitor pcc_monitor,
-                    MonitorNumber current_monitor,
-                    MonitorNumber end_monitor);
-
-  double GetCurrentRate() const;
-
-  UtilityState GetCurrentState() const;
-  bool GetEarlyEndFlag() const;
-  void SetEarlyEndFlag(bool newFlag);
-
- private:
-  UtilityState state_;
-
-  double current_rate_;
-  double waiting_rate_;
-  double probing_rate_;
-
-  MonitorNumber target_monitor_;  
-  bool current_monitor_early_end_;
-
-  double previous_utility_;
-  
-  // variables used for start phase
-  int loss_ignorance_count_;
-
-  // variables used for guess phase
-  int guess_time_;
-  int num_recorded_;
-  int continuous_guess_count_;
-  GuessStat guess_stat_bucket[NUMBER_OF_PROBE];
-
-  // variables used for moving phase
-  int change_direction_;
-  int change_intense_;
-
-  void GetBytesSum(std::vector<PacketInfo> packet_vector,
-                                      double& total,
-                                      double& lost);
-};
+namespace test {
+class PccSenderPeer;
+}  // namespace test
 
 class RttStats;
 
-class NET_EXPORT_PRIVATE PCCSender : public SendAlgorithmInterface {
+// PccSender implements the PCC congestion control algorithm. PccSender
+// evaluates the benefits of different sending rates by comparing their
+// utilities, and adjusts the sending rate towards the direction of
+// higher utility.
+class QUIC_EXPORT_PRIVATE PccSender
+    : public SendAlgorithmInterface,
+      public PccMonitorIntervalQueueDelegateInterface {
  public:
-  PCCSender(const QuicClock* clock, const RttStats* rtt_stats);
-  ~PCCSender() override;
+  // Sender's mode during a connection.
+  enum SenderMode {
+    // Initial phase of the connection. Sending rate gets doubled as
+    // long as utility keeps increasing, and the sender enters
+    // PROBING mode when utility decreases.
+    STARTING,
+    // Sender tries different sending rates to decide whether higher
+    // or lower sending rate has greater utility. Sender enters
+    // DECISION_MADE mode once a decision is made.
+    PROBING,
+    // Sender keeps increasing or decreasing sending rate until
+    // utility decreases, then sender returns to PROBING mode.
+    // TODO(tongmeng): a better name?
+    DECISION_MADE
+  };
 
-  // SendAlgorithmInterface methods.
+  // Indicates whether sender should increase or decrease sending rate.
+  enum RateChangeDirection { INCREASE, DECREASE };
+
+  PccSender(const RttStats* rtt_stats,
+            QuicPacketCount initial_congestion_window,
+            QuicPacketCount max_congestion_window, QuicRandom* random);
+  PccSender(const PccSender&) = delete;
+  PccSender& operator=(const PccSender&) = delete;
+  PccSender(PccSender&&) = delete;
+  PccSender& operator=(PccSender&&) = delete;
+  ~PccSender() override {}
+
+  // Start implementation of SendAlgorithmInterface.
+  bool InSlowStart() const override;
+  bool InRecovery() const override;
+
   void SetFromConfig(const QuicConfig& config,
-                     Perspective perspective) override {};
+                     Perspective perspective) override {}
+
   void ResumeConnectionState(
       const CachedNetworkParameters& cached_network_params,
-      bool max_bandwidth_resumption) override {};
-  void SetNumEmulatedConnections(int num_connections) override {};
+      bool max_bandwidth_resumption) override {}
+  void SetNumEmulatedConnections(int num_connections) override {}
   void OnCongestionEvent(bool rtt_updated,
                          QuicByteCount bytes_in_flight,
                          QuicTime event_time,
@@ -174,60 +79,69 @@ class NET_EXPORT_PRIVATE PCCSender : public SendAlgorithmInterface {
                     QuicPacketNumber packet_number,
                     QuicByteCount bytes,
                     HasRetransmittableData is_retransmittable) override;
-  void OnRetransmissionTimeout(bool packets_retransmitted) override {};
+  void OnRetransmissionTimeout(bool packets_retransmitted) override {}
   void OnConnectionMigration() override {}
-  QuicTime::Delta TimeUntilSend(
-      QuicTime now,
-      QuicByteCount bytes_in_flight) const override;
+  QuicTime::Delta TimeUntilSend(QuicTime now,
+                                QuicByteCount bytes_in_flight) override;
   QuicBandwidth PacingRate(QuicByteCount bytes_in_flight) const override;
   QuicBandwidth BandwidthEstimate() const override;
   QuicByteCount GetCongestionWindow() const override;
-  bool InSlowStart() const override;
-  bool InRecovery() const override;
   QuicByteCount GetSlowStartThreshold() const override;
   CongestionControlType GetCongestionControlType() const override;
-  
-  std::string GetDebugState() const override;
-  
-  void OnApplicationLimited(QuicByteCount bytes_in_flight) override {};
-  
+  string GetDebugState() const override;
+  void OnApplicationLimited(QuicByteCount bytes_in_flight) override {}
   // End implementation of SendAlgorithmInterface.
 
+  // Implementation of PccMonitorIntervalQueueDelegate.
+  // Called when all useful intervals' utilities are available,
+  // so the sender can make a decision.
+  void OnUtilityAvailable(
+      const std::vector<UtilityInfo>& utility_info) override;
+
  private:
-  const QuicTime::Delta alarm_granularity_ =
-      QuicTime::Delta::FromMicroseconds(1);
+  friend class test::PccSenderPeer;
+  // Returns true if next created monitor interval is useful,
+  // i.e., its utility will be used when a decision can be made.
+  bool CreateUsefulInterval() const;
+  // Maybe set sending_rate_mbps_ for next created monitor interval.
+  void MaybeSetSendingRate();
 
-  //const QuicClock* clock_;
-  
-  // PCC monitor variable
-  MonitorNumber current_monitor_;
-  MonitorNumber last_end_monitor_;
-  QuicTime current_monitor_end_time_;
+  // Returns true if the sender can enter DECISION_MADE from PROBING mode.
+  bool CanMakeDecision(const std::vector<UtilityInfo>& utility_info) const;
+  // Set the sending rate to the central rate used in PROBING mode.
+  void EnterProbing();
+  // Set the sending rate when entering DECISION_MADE from PROBING mode.
+  void EnterDecisionMade();
 
-  PCCMonitor monitors_[NUM_MONITOR];
-  PCCUtility pcc_utility_;
+  // Current mode of PccSender.
+  SenderMode mode_;
+  // Sending rate in Mbit/s for the next monitor intervals.
+  float sending_rate_mbps_;
+  // Most recent utility used when making the last rate change decision.
+  float latest_utility_;
+  // Duration of the current monitor interval.
+  QuicTime::Delta monitor_duration_;
+  // Current direction of rate changes.
+  RateChangeDirection direction_;
+  // Number of rounds sender remains in current mode.
+  size_t rounds_;
+  // Queue of monitor intervals with pending utilities.
+  PccMonitorIntervalQueue interval_queue_;
+
+  // Moving average of rtt.
+  QuicTime::Delta avg_rtt_;
+  // The last rtt sample.
+  QuicTime::Delta last_rtt_;
+  // Timestamp when the last rtt sample is received.
+  QuicTime time_last_rtt_received_;
+
+  // Maximum congestion window in bits, used to cap sending rate.
+  QuicByteCount max_cwnd_bits_;
+
   const RttStats* rtt_stats_;
-
-  QuicTime ideal_next_packet_send_time_;
-
-  // private PCC functions
-  // Start a new monitor
-  void StartMonitor(QuicTime sent_time);
-  // End previous monitor
-  void EndMonitor(MonitorNumber monitor_num);
-  // Get the monitor corresponding to the sequence number
-  MonitorNumber GetMonitor(QuicPacketNumber sequence_number);
-  
-#ifdef DEBUG_
-  // logging utility
-  QuicTime previous_timer_;
-  QuicByteCount send_bytes_;
-  QuicByteCount ack_bytes_;
-#endif
-  
-  DISALLOW_COPY_AND_ASSIGN(PCCSender);
+  QuicRandom* random_;
 };
 
-}  // namespace net
+}  // namespace gfe_quic
 
 #endif
