@@ -61,28 +61,27 @@ class QUIC_EXPORT_PRIVATE PccSender
   // Start implementation of SendAlgorithmInterface.
   bool InSlowStart() const override;
   bool InRecovery() const override;
+  bool IsProbingForMoreBandwidth() const override;
 
   void SetFromConfig(const QuicConfig& config,
                      Perspective perspective) override {}
 
-  void ResumeConnectionState(
-      const CachedNetworkParameters& cached_network_params,
-      bool max_bandwidth_resumption) override {}
+  void AdjustNetworkParameters(QuicBandwidth bandwidth,
+                               QuicTime::Delta rtt) override {}
   void SetNumEmulatedConnections(int num_connections) override {}
   void OnCongestionEvent(bool rtt_updated,
                          QuicByteCount bytes_in_flight,
                          QuicTime event_time,
-                         const CongestionVector& acked_packets,
-                         const CongestionVector& lost_packets) override;
-  bool OnPacketSent(QuicTime sent_time,
+                         const AckedPacketVector& acked_packets,
+                         const LostPacketVector& lost_packets) override;
+  void OnPacketSent(QuicTime sent_time,
                     QuicByteCount bytes_in_flight,
                     QuicPacketNumber packet_number,
                     QuicByteCount bytes,
                     HasRetransmittableData is_retransmittable) override;
   void OnRetransmissionTimeout(bool packets_retransmitted) override {}
   void OnConnectionMigration() override {}
-  QuicTime::Delta TimeUntilSend(QuicTime now,
-                                QuicByteCount bytes_in_flight) override;
+  bool CanSend(QuicByteCount bytes_in_flight) override;
   QuicBandwidth PacingRate(QuicByteCount bytes_in_flight) const override;
   QuicBandwidth BandwidthEstimate() const override;
   QuicByteCount GetCongestionWindow() const override;
@@ -103,7 +102,7 @@ class QUIC_EXPORT_PRIVATE PccSender
   // Returns true if next created monitor interval is useful,
   // i.e., its utility will be used when a decision can be made.
   bool CreateUsefulInterval() const;
-  // Maybe set sending_rate_mbps_ for next created monitor interval.
+  // Maybe set sending_rate_ for next created monitor interval.
   void MaybeSetSendingRate();
 
   // Returns true if the sender can enter DECISION_MADE from PROBING mode.
@@ -115,8 +114,8 @@ class QUIC_EXPORT_PRIVATE PccSender
 
   // Current mode of PccSender.
   SenderMode mode_;
-  // Sending rate in Mbit/s for the next monitor intervals.
-  float sending_rate_mbps_;
+  // Sending rate for the next monitor intervals.
+  QuicBandwidth sending_rate_;
   // Most recent utility used when making the last rate change decision.
   float latest_utility_;
   // Duration of the current monitor interval.
@@ -128,15 +127,8 @@ class QUIC_EXPORT_PRIVATE PccSender
   // Queue of monitor intervals with pending utilities.
   PccMonitorIntervalQueue interval_queue_;
 
-  // Moving average of rtt.
-  QuicTime::Delta avg_rtt_;
-  // The last rtt sample.
-  QuicTime::Delta last_rtt_;
-  // Timestamp when the last rtt sample is received.
-  QuicTime time_last_rtt_received_;
-
-  // Maximum congestion window in bits, used to cap sending rate.
-  QuicByteCount max_cwnd_bits_;
+  // Maximum congestion window in bytes, used to cap sending rate.
+  QuicByteCount max_cwnd_bytes_;
 
   const RttStats* rtt_stats_;
   QuicRandom* random_;
