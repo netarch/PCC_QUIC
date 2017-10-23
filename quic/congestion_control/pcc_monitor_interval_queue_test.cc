@@ -10,6 +10,8 @@ using testing::_;
 namespace gfe_quic {
 namespace test {
 namespace {
+// Number of bits per Mbit
+const size_t kMegabit = 1024 * 1024;
 
 class MockDelegate : public PccMonitorIntervalQueueDelegateInterface {
  public:
@@ -37,7 +39,9 @@ class PccMonitorIntervalQueueTest : public QuicTest {
         QuicTime::Delta::FromMicroseconds(packet_interval_us);
 
     sent_time = sent_time + packet_interval;
-    queue_.EnqueueNewMonitorInterval(sending_rate_mbps, is_useful, 30000);
+    QuicBandwidth sending_rate =
+        QuicBandwidth::FromBitsPerSecond(sending_rate_mbps * kMegabit);
+    queue_.EnqueueNewMonitorInterval(sending_rate, is_useful, 0.0, 30000);
     queue_.OnPacketSent(sent_time, first_packet_number, kMaxPacketSize);
     for (size_t i = 1; i < count_packet; ++i) {
       sent_time = sent_time + packet_interval;
@@ -75,17 +79,17 @@ TEST_F(PccMonitorIntervalQueueTest, OnPacketSent) {
 
   // Create a new monitor interval.
   SendMonitorInterval(2.0, true, sent_time, 0, 1);
-  // Check the current last_packet_sent_time and bytes_total.
+  // Check the current last_packet_sent_time and bytes_sent.
   MonitorInterval interval = queue_.current();
-  EXPECT_EQ(kMaxPacketSize, interval.bytes_total);
+  EXPECT_EQ(kMaxPacketSize, interval.bytes_sent);
   EXPECT_EQ(sent_time + packet_interval, interval.last_packet_sent_time);
 
   // Sent another packet in this MonitorInterval.
   sent_time = sent_time + 2 * packet_interval;
   queue_.OnPacketSent(sent_time, 1, kMaxPacketSize);
   interval = queue_.current();
-  // Check the last_packet_sent and bytes_total are updated.
-  EXPECT_EQ(2 * kMaxPacketSize, interval.bytes_total);
+  // Check the last_packet_sent and bytes_sent are updated.
+  EXPECT_EQ(2 * kMaxPacketSize, interval.bytes_sent);
   EXPECT_EQ(sent_time, interval.last_packet_sent_time);
 }
 
@@ -125,7 +129,7 @@ TEST_F(PccMonitorIntervalQueueTest, OnCongestionEvent) {
   float count_packet = duration_us / packet_interval_us;
 
   // Create six MonitorIntervals, with the last one being not 'useful'.
-  // Create four useful MonitorIntervals
+  // Create four useful MonitorIntervals.
   for (size_t i = 0; i < 4; ++i) {
     SendMonitorInterval(2.0, true, sent_time, i * count_packet, count_packet);
   }
@@ -211,6 +215,55 @@ TEST_F(PccMonitorIntervalQueueTest, InvalidUtility) {
   EXPECT_EQ(1u, queue_.size());
 }
 
+// Regression test for b/64447079. This test mimics the scenario that a monitor
+// interval can become available multiple times. For example, packets 1 and 2
+// are sent in a monitor interval and get acked. Then packet 3 is sent in the
+// same monitor interval and get acked.
+TEST_F(PccMonitorIntervalQueueTest, AvailableIntervalsCountBug) {
+  QuicTime sent_time = QuicTime::Zero();
+
+  // Send packets in 4 useful intervals. Each interval contains two packets.
+  for (size_t i = 0; i < 4; ++i) {
+    SendMonitorInterval(2.0, true, sent_time, 2 * i + 1, 2);
+    sent_time = sent_time + QuicTime::Delta::FromMicroseconds(100000);
+  }
+  EXPECT_EQ(4u, queue_.size());
+  EXPECT_EQ(4u, queue_.num_useful_intervals());
+  EXPECT_EQ(0u, queue_.num_available_intervals());
+
+  // Ack all the packets in the first two intervals.
+  SendAlgorithmInterface::CongestionVector packets_acked, packets_lost;
+  for (size_t i = 1; i <= 4; ++i) {
+    packets_acked.push_back(std::make_pair(i, kMaxPacketSize));
+  }
+  // Ack packets in the 4th interval.
+  packets_acked.push_back(std::make_pair(7, kMaxPacketSize));
+  packets_acked.push_back(std::make_pair(8, kMaxPacketSize));
+  queue_.OnCongestionEvent(packets_acked, packets_lost, 30000);
+  EXPECT_EQ(3u, queue_.num_available_intervals());
+
+  // Send one more packet in the 4th useful interval.
+  queue_.OnPacketSent(sent_time, 9, kMaxPacketSize);
+  EXPECT_EQ(4u, queue_.size());
+  EXPECT_EQ(4u, queue_.num_useful_intervals());
+  // Ack packet 9.
+  packets_acked.clear();
+  packets_acked.push_back(std::make_pair(9, kMaxPacketSize));
+  EXPECT_CALL(delegate_, OnUtilityAvailable(_)).Times(0);
+  queue_.OnCongestionEvent(packets_acked, packets_lost, 30000);
+  // Number of available intervals is still 3.
+  EXPECT_EQ(3u, queue_.num_available_intervals());
+
+  // Ack packets 5 and 6.
+  packets_acked.clear();
+  packets_acked.push_back(std::make_pair(5, kMaxPacketSize));
+  packets_acked.push_back(std::make_pair(6, kMaxPacketSize));
+  EXPECT_CALL(delegate_, OnUtilityAvailable(_)).Times(1);
+  queue_.OnCongestionEvent(packets_acked, packets_lost, 30000);
+  EXPECT_EQ(0u, queue_.num_available_intervals());
+}
+
 }  // namespace
 }  // namespace test
 }  // namespace gfe_quic
+                                                                                
