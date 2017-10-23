@@ -17,35 +17,43 @@ const float kRTTCoefficient = -200.0f;
 }  // namespace
 
 MonitorInterval::MonitorInterval()
-    : first_packet_sent_time(QuicTime::Zero()),
-      last_packet_sent_time(QuicTime::Zero()),
-      first_packet_number(0),
-      last_packet_number(0),
-      bytes_total(0),
-      bytes_acked(0),
-      bytes_lost(0),
-      utility(0.0) {}
-
-MonitorInterval::MonitorInterval(float sending_rate_mbps,
-                                 bool is_useful,
-                                 int64_t rtt_us)
-    : sending_rate_mbps(sending_rate_mbps),
-      is_useful(is_useful),
+    : sending_rate(QuicBandwidth::Zero()),
+      is_useful(false),
+      rtt_fluctuation_tolerance_ratio(0.0),
       first_packet_sent_time(QuicTime::Zero()),
       last_packet_sent_time(QuicTime::Zero()),
       first_packet_number(0),
       last_packet_number(0),
-      bytes_total(0),
+      bytes_sent(0),
+      bytes_acked(0),
+      bytes_lost(0),
+      rtt_on_monitor_start_us(0),
+      rtt_on_monitor_end_us(0),
+      utility(0.0) {}
+
+MonitorInterval::MonitorInterval(QuicBandwidth sending_rate,
+                                 bool is_useful,
+                                 float rtt_fluctuation_tolerance_ratio,
+                                 int64_t rtt_us)
+    : sending_rate(sending_rate),
+      is_useful(is_useful),
+      rtt_fluctuation_tolerance_ratio(rtt_fluctuation_tolerance_ratio),
+      first_packet_sent_time(QuicTime::Zero()),
+      last_packet_sent_time(QuicTime::Zero()),
+      first_packet_number(0),
+      last_packet_number(0),
+      bytes_sent(0),
       bytes_acked(0),
       bytes_lost(0),
       rtt_on_monitor_start_us(rtt_us),
       rtt_on_monitor_end_us(rtt_us),
       utility(0.0) {}
 
-UtilityInfo::UtilityInfo() : sending_rate_mbps(0.0), utility(0.0) {}
+UtilityInfo::UtilityInfo()
+    : sending_rate(QuicBandwidth::Zero()), utility(0.0) {}
 
-UtilityInfo::UtilityInfo(float rate, float utility)
-    : sending_rate_mbps(rate), utility(utility) {}
+UtilityInfo::UtilityInfo(QuicBandwidth rate, float utility)
+    : sending_rate(rate), utility(utility) {}
 
 PccMonitorIntervalQueue::PccMonitorIntervalQueue(
     PccMonitorIntervalQueueDelegateInterface* delegate)
@@ -53,22 +61,28 @@ PccMonitorIntervalQueue::PccMonitorIntervalQueue(
       num_available_intervals_(0),
       delegate_(delegate) {}
 
-void PccMonitorIntervalQueue::EnqueueNewMonitorInterval(float sending_rate_mbps,
-                                                        bool is_useful,
-                                                        int64_t rtt_us) {
+void PccMonitorIntervalQueue::EnqueueNewMonitorInterval(
+    QuicBandwidth sending_rate,
+    bool is_useful,
+    float rtt_fluctuation_tolerance_ratio,
+    int64_t rtt_us) {
   if (is_useful) {
     ++num_useful_intervals_;
   }
 
-  monitor_intervals_.emplace_back(sending_rate_mbps, is_useful, rtt_us);
+  monitor_intervals_.emplace_back(sending_rate, is_useful,
+                                  rtt_fluctuation_tolerance_ratio, rtt_us);
 }
 
 void PccMonitorIntervalQueue::OnPacketSent(QuicTime sent_time,
                                            QuicPacketNumber packet_number,
                                            QuicByteCount bytes) {
-  DCHECK(!monitor_intervals_.empty());
+  if (monitor_intervals_.empty()) {
+    QUIC_BUG << "OnPacketSent called with empty queue.";
+    return;
+  }
 
-  if (monitor_intervals_.back().bytes_total == 0) {
+  if (monitor_intervals_.back().bytes_sent == 0) {
     // This is the first packet of this interval.
     monitor_intervals_.back().first_packet_sent_time = sent_time;
     monitor_intervals_.back().first_packet_number = packet_number;
@@ -76,13 +90,14 @@ void PccMonitorIntervalQueue::OnPacketSent(QuicTime sent_time,
 
   monitor_intervals_.back().last_packet_sent_time = sent_time;
   monitor_intervals_.back().last_packet_number = packet_number;
-  monitor_intervals_.back().bytes_total += bytes;
+  monitor_intervals_.back().bytes_sent += bytes;
 }
 
 void PccMonitorIntervalQueue::OnCongestionEvent(
-    const SendAlgorithmInterface::CongestionVector& acked_packets,
-    const SendAlgorithmInterface::CongestionVector& lost_packets,
+    const AckedPacketVector& acked_packets,
+    const LostPacketVector& lost_packets,
     int64_t rtt_us) {
+  num_available_intervals_ = 0;
   if (num_useful_intervals_ == 0) {
     // Skip all the received packets if no intervals are useful.
     return;
@@ -90,24 +105,26 @@ void PccMonitorIntervalQueue::OnCongestionEvent(
 
   bool has_invalid_utility = false;
   for (MonitorInterval& interval : monitor_intervals_) {
-    if (!interval.is_useful || IsUtilityAvailable(interval)) {
-      // Skips intervals that are not useful, or have available utilities
+    if (!interval.is_useful) {
+      // Skips useless monitor intervals.
       continue;
     }
 
-    for (SendAlgorithmInterface::CongestionVector::const_iterator it =
-             lost_packets.cbegin();
-         it != lost_packets.cend(); ++it) {
-      if (IntervalContainsPacket(interval, it->first)) {
-        interval.bytes_lost += it->second;
+    if (IsUtilityAvailable(interval)) {
+      // Skip intervals with available utilities.
+      ++num_available_intervals_;
+      continue;
+    }
+
+    for (const LostPacket& lost_packet : lost_packets) {
+      if (IntervalContainsPacket(interval, lost_packet.packet_number)) {
+        interval.bytes_lost += lost_packet.bytes_lost;
       }
     }
 
-    for (SendAlgorithmInterface::CongestionVector::const_iterator it =
-             acked_packets.cbegin();
-         it != acked_packets.cend(); ++it) {
-      if (IntervalContainsPacket(interval, it->first)) {
-        interval.bytes_acked += it->second;
+    for (const AckedPacket& acked_packet : acked_packets) {
+      if (IntervalContainsPacket(interval, acked_packet.packet_number)) {
+        interval.bytes_acked += acked_packet.bytes_acked;
       }
     }
 
@@ -137,7 +154,7 @@ void PccMonitorIntervalQueue::OnCongestionEvent(
       }
       // All the useful intervals should have available utilities now.
       utility_info.push_back(
-          UtilityInfo(interval.sending_rate_mbps, interval.utility));
+          UtilityInfo(interval.sending_rate, interval.utility));
     }
     DCHECK_EQ(num_available_intervals_, utility_info.size());
 
@@ -168,9 +185,15 @@ size_t PccMonitorIntervalQueue::size() const {
   return monitor_intervals_.size();
 }
 
+void PccMonitorIntervalQueue::OnRttInflationInStarting() {
+  monitor_intervals_.clear();
+  num_useful_intervals_ = 0;
+  num_available_intervals_ = 0;
+}
+
 bool PccMonitorIntervalQueue::IsUtilityAvailable(
     const MonitorInterval& interval) const {
-  return (interval.bytes_acked + interval.bytes_lost == interval.bytes_total);
+  return (interval.bytes_acked + interval.bytes_lost == interval.bytes_sent);
 }
 
 bool PccMonitorIntervalQueue::IntervalContainsPacket(
@@ -193,22 +216,27 @@ bool PccMonitorIntervalQueue::CalculateUtility(MonitorInterval* interval) {
 
   float rtt_ratio = static_cast<float>(interval->rtt_on_monitor_start_us) /
                     static_cast<float>(interval->rtt_on_monitor_end_us);
+  if (rtt_ratio > 1.0 - interval->rtt_fluctuation_tolerance_ratio &&
+      rtt_ratio < 1.0 + interval->rtt_fluctuation_tolerance_ratio) {
+    rtt_ratio = 1.0;
+  }
+  float latency_penalty =
+      1.0 - 1.0 / (1.0 + exp(kRTTCoefficient * (1.0 - rtt_ratio)));
 
   float bytes_acked = static_cast<float>(interval->bytes_acked);
   float bytes_lost = static_cast<float>(interval->bytes_lost);
-  float bytes_total = static_cast<float>(interval->bytes_total);
+  float bytes_sent = static_cast<float>(interval->bytes_sent);
+  float loss_rate = bytes_lost / bytes_sent;
+  float loss_penalty =
+      1.0 - 1.0 / (1.0 + exp(kLossCoefficient * (loss_rate - kLossTolerance)));
 
-  float current_utility =
-      (bytes_acked / static_cast<float>(mi_duration) *
-           (1.0 -
-            1.0 / (1.0 + exp(kLossCoefficient *
-                             (bytes_lost / bytes_total - kLossTolerance)))) *
-           (1.0 - 1.0 / (1.0 + exp(kRTTCoefficient * (1.0 - rtt_ratio)))) -
-       bytes_lost / static_cast<float>(mi_duration)) *
-      1000.0;
+  interval->utility = (bytes_acked / static_cast<float>(mi_duration) *
+                           loss_penalty * latency_penalty -
+                       bytes_lost / static_cast<float>(mi_duration)) *
+                      1000.0;
 
-  interval->utility = current_utility;
   return true;
 }
 
 }  // namespace gfe_quic
+                                                                                
