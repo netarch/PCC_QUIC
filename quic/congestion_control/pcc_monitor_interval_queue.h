@@ -17,13 +17,18 @@ namespace gfe_quic {
 // - calculate the MonitorInterval's utility value.
 struct MonitorInterval {
   MonitorInterval();
-  MonitorInterval(float sending_rate_mbps, bool is_useful, int64_t rtt_us);
+  MonitorInterval(QuicBandwidth sending_rate,
+                  bool is_useful,
+                  float rtt_fluctuation_tolerance_ratio,
+                  int64_t rtt_us);
   ~MonitorInterval() {}
 
-  // Sending rate in Mbit/s.
-  float sending_rate_mbps;
+  // Sending rate.
+  QuicBandwidth sending_rate;
   // True if calculating utility for this MonitorInterval.
   bool is_useful;
+  // The tolerable rtt fluctuation ratio.
+  float rtt_fluctuation_tolerance_ratio;
 
   // Sent time of the first packet.
   QuicTime first_packet_sent_time;
@@ -36,13 +41,13 @@ struct MonitorInterval {
   QuicPacketNumber last_packet_number;
 
   // Number of bytes which are sent in total.
-  QuicByteCount bytes_total;
+  QuicByteCount bytes_sent;
   // Number of bytes which have been acked.
   QuicByteCount bytes_acked;
   // Number of bytes which are considered as lost.
   QuicByteCount bytes_lost;
 
-  // RTT when the first packet is sent.
+  // Smoothed RTT when the first packet is sent.
   int64_t rtt_on_monitor_start_us;
   // RTT when all sent packets are either acked or lost.
   int64_t rtt_on_monitor_end_us;
@@ -52,13 +57,13 @@ struct MonitorInterval {
   float utility;
 };
 
-// UtilityInfo is used to store <sending_rate_mbps, utility> pairs
+// UtilityInfo is used to store <sending_rate, utility> pairs
 struct UtilityInfo {
   UtilityInfo();
-  UtilityInfo(float rate, float utility);
+  UtilityInfo(QuicBandwidth rate, float utility);
   ~UtilityInfo() {}
 
-  float sending_rate_mbps;
+  QuicBandwidth sending_rate;
   float utility;
 };
 
@@ -89,8 +94,9 @@ class PccMonitorIntervalQueue {
   // Creates a new MonitorInterval and add it to the tail of the
   // monitor interval queue, provided the necessary variables
   // for MonitorInterval initialization.
-  void EnqueueNewMonitorInterval(float sending_rate_mbps,
+  void EnqueueNewMonitorInterval(QuicBandwidth sending_rate,
                                  bool is_useful,
+                                 float rtt_fluctuation_tolerance_ratio,
                                  int64_t rtt_us);
 
   // Called when a packet belonging to current monitor interval is sent.
@@ -99,14 +105,18 @@ class PccMonitorIntervalQueue {
                     QuicByteCount bytes);
 
   // Called when packets are acked or considered as lost.
-  void OnCongestionEvent(
-      const SendAlgorithmInterface::CongestionVector& acked_packets,
-      const SendAlgorithmInterface::CongestionVector& lost_packets,
-      int64_t rtt_us);
+  void OnCongestionEvent(const AckedPacketVector& acked_packets,
+                         const LostPacketVector& lost_packets,
+                         int64_t rtt_us);
 
-  // Returns the most recent MonitorInterval in the tail of the queue
+  // Called when RTT inflation ratio is greater than
+  // max_rtt_fluctuation_tolerance_ratio_in_starting.
+  void OnRttInflationInStarting();
+
+  // Returns the most recent MonitorInterval in the tail of the queue.
   const MonitorInterval& current() const;
   size_t num_useful_intervals() const { return num_useful_intervals_; }
+  size_t num_available_intervals() const { return num_available_intervals_; }
   bool empty() const;
   size_t size() const;
 
