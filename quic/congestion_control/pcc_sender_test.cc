@@ -9,24 +9,29 @@
 #include "gfe/quic/test_tools/quic_test_utils.h"
 
 namespace gfe_quic {
+DECLARE_double(max_rtt_fluctuation_tolerance_ratio_in_starting);
+DECLARE_double(max_rtt_fluctuation_tolerance_ratio_in_decision_made);
+
 namespace test {
+
+namespace {
+// Number of bits per Mbit.
+const size_t kMegabit = 1024 * 1024;
+}
 
 class PccSenderPeer {
  public:
   static PccSender::SenderMode mode(PccSender* sender) { return sender->mode_; }
 
   static float sending_rate(PccSender* sender) {
-    return sender->sending_rate_mbps_;
+    return sender->sending_rate_.ToBitsPerSecond() /
+           static_cast<float>(kMegabit);
   }
 
   static size_t rounds(PccSender* sender) { return sender->rounds_; }
 
   static PccSender::RateChangeDirection direction(PccSender* sender) {
     return sender->direction_;
-  }
-
-  static QuicTime interval_start_time(PccSender* sender) {
-    return sender->interval_queue_.current().first_packet_sent_time;
   }
 
   static size_t num_useful(PccSender* sender) {
@@ -39,6 +44,10 @@ class PccSenderPeer {
 
   static QuicTime::Delta duration(PccSender* sender) {
     return sender->monitor_duration_;
+  }
+
+  static QuicTime::Delta latest_rtt(PccSender* sender) {
+    return sender->rtt_stats_->latest_rtt();
   }
 
   // Set the state of sender to facilitate unit test.
@@ -67,14 +76,20 @@ class PccSenderTest : public QuicTest {
   }
 
   // Create a monitor interval and send maximum packets allowed in it based on
-  // sending rate and interval duration. Returns the number of sent packets.
+  // sending rate and interval duration. Note that this function is only called
+  // after sender has the valid rtt.
   void SendPacketsInOneInterval() {
+    DCHECK(!PccSenderPeer::latest_rtt(&sender_).IsZero())
+        << "SendPacketsInOneInterval can only be called when latest RTT is "
+           "available";
+
+    QuicTime interval_start_time = clock_.Now();
     do {
       sender_.OnPacketSent(clock_.Now(), 0, ++packet_number_, kMaxPacketSize,
                            HAS_RETRANSMITTABLE_DATA);
       clock_.AdvanceTime(QuicTime::Delta::FromMicroseconds(
           kMaxPacketSize * 8 / PccSenderPeer::sending_rate(&sender_)));
-    } while (clock_.Now() - PccSenderPeer::interval_start_time(&sender_) <
+    } while (clock_.Now() - interval_start_time <
              PccSenderPeer::duration(&sender_));
   }
 
@@ -82,8 +97,7 @@ class PccSenderTest : public QuicTest {
   // acked.
   void AckPackets(QuicPacketNumber start_packet_number,
                   QuicPacketNumber end_packet_number) {
-    for (QuicPacketNumber i = start_packet_number; i < end_packet_number;
-         ++i) {
+    for (QuicPacketNumber i = start_packet_number; i < end_packet_number; ++i) {
       packets_acked_.push_back(std::make_pair(i, kMaxPacketSize));
     }
   }
@@ -91,8 +105,7 @@ class PccSenderTest : public QuicTest {
   // Mark packets within range [start_packet_number, end_packet_number) as lost.
   void LosePackets(QuicPacketNumber start_packet_number,
                    QuicPacketNumber end_packet_number) {
-    for (QuicPacketNumber i = start_packet_number; i < end_packet_number;
-         ++i) {
+    for (QuicPacketNumber i = start_packet_number; i < end_packet_number; ++i) {
       packets_lost_.push_back(std::make_pair(i, kMaxPacketSize));
     }
   }
@@ -111,42 +124,43 @@ class PccSenderTest : public QuicTest {
 };
 
 TEST_F(PccSenderTest, AlwaysCreatNonUsefulIntervalUntilRttStatValid) {
-  // Send Packets in 10 monitor intervals without initializing RTT stats. All
-  // 10 intervals are non useful.
-  for (size_t i = 0; i < 10; ++i) {
-    SendPacketsInOneInterval();
-    // Each non-useful interval contains one pacekt.
-    EXPECT_EQ(i + 1, packet_number_);
-  }
-  // Verify that there are 10 intervals, but none of them are useful.
-  EXPECT_EQ(10u, PccSenderPeer::num_intervals(&sender_));
+  sender_.OnPacketSent(clock_.Now(), 0, ++packet_number_, kMaxPacketSize,
+                       HAS_RETRANSMITTABLE_DATA);
+  // Advance the clock by 1 sec.
+  clock_.AdvanceTime(QuicTime::Delta::FromSeconds(1));
+  // Sent another packet.
+  sender_.OnPacketSent(clock_.Now(), 0, ++packet_number_, kMaxPacketSize,
+                       HAS_RETRANSMITTABLE_DATA);
+  // The two packets should be in one non-useful monitor interval.
+  EXPECT_EQ(1u, PccSenderPeer::num_intervals(&sender_));
   EXPECT_EQ(0u, PccSenderPeer::num_useful(&sender_));
 
-  // Set the latest rtt to be 30ms.
+  // Set the smoothed rtt to be 30ms.
   rtt_stats_.UpdateRtt(QuicTime::Delta::FromMilliseconds(30),
                        QuicTime::Delta::Zero(), QuicTime::Zero());
-  // Acknowledge all sent packets and avg_rtt_ is updated.
-  AckPackets(1, packet_number_ + 1);
-  sender_.OnCongestionEvent(true, 0, QuicTime::Zero(), packets_acked_,
-                            packets_lost_);
-  // Sent packets for another interval, it will be useful.
+  // Send packets for another interval, it will be useful.
   SendPacketsInOneInterval();
-  EXPECT_EQ(11u, PccSenderPeer::num_intervals(&sender_));
+  EXPECT_EQ(2u, PccSenderPeer::num_intervals(&sender_));
+  EXPECT_EQ(1u, PccSenderPeer::num_useful(&sender_));
+
+  // Advance the clock by 1 sec, so next sent packet will be in a new interval.
+  clock_.AdvanceTime(QuicTime::Delta::FromSeconds(1));
+  // Send a new packet.
+  sender_.OnPacketSent(clock_.Now(), 0, ++packet_number_, kMaxPacketSize,
+                       HAS_RETRANSMITTABLE_DATA);
+  // A new non-useful monitor interval is created.
+  EXPECT_EQ(3u, PccSenderPeer::num_intervals(&sender_));
   EXPECT_EQ(1u, PccSenderPeer::num_useful(&sender_));
 }
 
 TEST_F(PccSenderTest, StayInStarting) {
+  // First initialize the smoothed rtt to be 30ms.
+  rtt_stats_.UpdateRtt(QuicTime::Delta::FromMilliseconds(30),
+                       QuicTime::Delta::Zero(), QuicTime::Zero());
   // Sender should start in STARTING mode.
   EXPECT_EQ(PccSender::STARTING, PccSenderPeer::mode(&sender_));
   EXPECT_EQ(1u, PccSenderPeer::rounds(&sender_));
   float initial_rate_mbps = PccSenderPeer::sending_rate(&sender_);
-
-  // First initialize the latest rtt to be 30ms.
-  rtt_stats_.UpdateRtt(QuicTime::Delta::FromMilliseconds(30),
-                       QuicTime::Delta::Zero(), QuicTime::Zero());
-  // Update avg_rtt_.
-  sender_.OnCongestionEvent(true, 0, QuicTime::Zero(), packets_acked_,
-                            packets_lost_);
 
   SendPacketsInOneInterval();
   AckPackets(1, packet_number_ + 1);
@@ -161,15 +175,11 @@ TEST_F(PccSenderTest, StayInStarting) {
 }
 
 TEST_F(PccSenderTest, StartingToProbing) {
+  rtt_stats_.UpdateRtt(QuicTime::Delta::FromMilliseconds(30),
+                       QuicTime::Delta::Zero(), QuicTime::Zero());
   EXPECT_EQ(PccSender::STARTING, PccSenderPeer::mode(&sender_));
   EXPECT_EQ(1u, PccSenderPeer::rounds(&sender_));
   float initial_rate_mbps = PccSenderPeer::sending_rate(&sender_);
-
-  rtt_stats_.UpdateRtt(QuicTime::Delta::FromMilliseconds(30),
-                       QuicTime::Delta::Zero(), QuicTime::Zero());
-  // Update avg_rtt_.
-  sender_.OnCongestionEvent(true, 0, QuicTime::Zero(), packets_acked_,
-                            packets_lost_);
 
   // Send all the packets for the first useful monitor interval.
   SendPacketsInOneInterval();
@@ -185,17 +195,13 @@ TEST_F(PccSenderTest, StartingToProbing) {
 }
 
 TEST_F(PccSenderTest, ProbingToDecisionMadeIncrease) {
-  // Send Packets in a monitor interval without initializing RTT stats. This
-  // interval is non-useful.
-  SendPacketsInOneInterval();
+  // Sent a packet to create a non-useful interval in the queue.
+  sender_.OnPacketSent(clock_.Now(), 0, ++packet_number_, kMaxPacketSize,
+                       HAS_RETRANSMITTABLE_DATA);
+  // Advance the clock by 100 us, so the next packet is sent at different time.
+  clock_.AdvanceTime(QuicTime::Delta::FromMicroseconds(100));
   rtt_stats_.UpdateRtt(QuicTime::Delta::FromMilliseconds(30),
                        QuicTime::Delta::Zero(), QuicTime::Zero());
-  // The non-useful interval should contain only a single packet.
-  EXPECT_EQ(1u, packet_number_);
-  // Acknowledge the sent packet, so that avg_rtt_ can be updated.
-  AckPackets(1, packet_number_ + 1);
-  sender_.OnCongestionEvent(true, 0, QuicTime::Zero(), packets_acked_,
-                            packets_lost_);
   // Set the mode of sender to PROBING for convenience.
   PccSenderPeer::SetMode(&sender_, PccSender::PROBING, PccSender::INCREASE);
   float initial_rate_mbps = PccSenderPeer::sending_rate(&sender_);
@@ -212,7 +218,7 @@ TEST_F(PccSenderTest, ProbingToDecisionMadeIncrease) {
   ExpectApproxEq(initial_rate_mbps, PccSenderPeer::sending_rate(&sender_),
                  0.001f);
 
-  AckPackets(2, packet_number_ + 1);
+  AckPackets(1, packet_number_ + 1);
   sender_.OnCongestionEvent(true, 0, QuicTime::Zero(), packets_acked_,
                             packets_lost_);
   // The intervals with larger sending rate should have higher utility, because
@@ -245,10 +251,6 @@ TEST_F(PccSenderTest, ProbingToDecisionMadeDecrease) {
   // Initialize RTT. So the first interval would be useful.
   rtt_stats_.UpdateRtt(QuicTime::Delta::FromMilliseconds(30),
                        QuicTime::Delta::Zero(), QuicTime::Zero());
-  // Update avg_rtt_.
-  sender_.OnCongestionEvent(true, 0, QuicTime::Zero(), packets_acked_,
-                            packets_lost_);
-
   PccSenderPeer::SetMode(&sender_, PccSender::PROBING, PccSender::INCREASE);
   float initial_rate_mbps = PccSenderPeer::sending_rate(&sender_);
 
@@ -274,9 +276,6 @@ TEST_F(PccSenderTest, ProbingToDecisionMadeDecrease) {
 TEST_F(PccSenderTest, CannotMakeDecisionBecauseInconsistentResults) {
   rtt_stats_.UpdateRtt(QuicTime::Delta::FromMilliseconds(30),
                        QuicTime::Delta::Zero(), QuicTime::Zero());
-  // Update avg_rtt_.
-  sender_.OnCongestionEvent(true, 0, QuicTime::Zero(), packets_acked_,
-                            packets_lost_);
   // Set the mode of sender to PROBING.
   PccSenderPeer::SetMode(&sender_, PccSender::PROBING, PccSender::INCREASE);
   float initial_rate_mbps = PccSenderPeer::sending_rate(&sender_);
@@ -318,9 +317,6 @@ TEST_F(PccSenderTest, CannotMakeDecisionBecauseInconsistentResults) {
 TEST_F(PccSenderTest, StayInDecisionMade) {
   rtt_stats_.UpdateRtt(QuicTime::Delta::FromMilliseconds(30),
                        QuicTime::Delta::Zero(), QuicTime::Zero());
-  // Update avg_rtt_.
-  sender_.OnCongestionEvent(true, 0, QuicTime::Zero(), packets_acked_,
-                            packets_lost_);
   PccSenderPeer::SetMode(&sender_, PccSender::DECISION_MADE,
                          PccSender::INCREASE);
   float initial_rate_mbps = PccSenderPeer::sending_rate(&sender_);
@@ -332,7 +328,7 @@ TEST_F(PccSenderTest, StayInDecisionMade) {
   sender_.OnCongestionEvent(true, 0, QuicTime::Zero(), packets_acked_,
                             packets_lost_);
 
-  // Sender stays in DecisionMade mode, and further increases sending rate to
+  // Sender stays in DECISION_MADE mode, and further increases sending rate to
   // initial_rate_mbps * (1 + rounds_ * 0.02), where rounds_ equals 2.
   EXPECT_EQ(PccSender::DECISION_MADE, PccSenderPeer::mode(&sender_));
   EXPECT_EQ(2u, PccSenderPeer::rounds(&sender_));
@@ -341,12 +337,284 @@ TEST_F(PccSenderTest, StayInDecisionMade) {
                  PccSenderPeer::sending_rate(&sender_), 0.001f);
 }
 
+TEST_F(PccSenderTest, EarlyTerminationInStarting) {
+  QuicTime::Delta rtt = QuicTime::Delta::FromMicroseconds(30000);
+  rtt_stats_.UpdateRtt(rtt, QuicTime::Delta::Zero(), QuicTime::Zero());
+  float initial_rate_mbps = PccSenderPeer::sending_rate(&sender_);
+
+  // Send all the packets for a useful monitor interval.
+  SendPacketsInOneInterval();
+  // Update the RTT so that the smoothed rtt is increased by
+  // 1.1 * FLAGS_max_rtt_fluctuation_tolerance_ratio_in_starting.
+  rtt_stats_.UpdateRtt(
+      (1 + 8 * 1.1 * FLAGS_max_rtt_fluctuation_tolerance_ratio_in_starting) *
+          rtt_stats_.smoothed_rtt(),
+      QuicTime::Delta::Zero(), QuicTime::Zero());
+  // Allow a small margin for float/int64_t cast.
+  EXPECT_LT(
+      ((1 + 1.1 * FLAGS_max_rtt_fluctuation_tolerance_ratio_in_starting) * rtt)
+              .ToMicroseconds() -
+          rtt_stats_.smoothed_rtt().ToMicroseconds(),
+      2);
+  // Acknowledge all the packets for the interval.
+  packets_acked_.clear();
+  AckPackets(1, packet_number_ + 1);
+  sender_.OnCongestionEvent(true, 0, QuicTime::Zero(), packets_acked_,
+                            packets_lost_);
+
+  // Sender exits STARTING mode, and halves the sending rate to
+  // initial_rate_mbps / 2, with rounds_ reset to 1.
+  EXPECT_EQ(PccSender::PROBING, PccSenderPeer::mode(&sender_));
+  EXPECT_EQ(1u, PccSenderPeer::rounds(&sender_));
+  ExpectApproxEq(initial_rate_mbps / 2, PccSenderPeer::sending_rate(&sender_),
+                 0.001f);
+}
+
+TEST_F(PccSenderTest, LatencyInflationToleranceInStarting) {
+  QuicTime::Delta rtt = QuicTime::Delta::FromMicroseconds(30000);
+  rtt_stats_.UpdateRtt(rtt, QuicTime::Delta::Zero(), QuicTime::Zero());
+  float initial_rate_mbps = PccSenderPeer::sending_rate(&sender_);
+  QuicPacketNumber start_packet_number = 1;
+
+  // Send all the packets for the first useful monitor interval.
+  SendPacketsInOneInterval();
+  // Acknowledge all the packets for the first useful interval.
+  AckPackets(start_packet_number, packet_number_ + 1);
+  sender_.OnCongestionEvent(true, 0, QuicTime::Zero(), packets_acked_,
+                            packets_lost_);
+  EXPECT_EQ(PccSender::STARTING, PccSenderPeer::mode(&sender_));
+  EXPECT_EQ(2u, PccSenderPeer::rounds(&sender_));
+  ExpectApproxEq(initial_rate_mbps * 2.0f,
+                 PccSenderPeer::sending_rate(&sender_), 0.001f);
+
+  // Send all the packets for the second useful monitor interval.
+  start_packet_number = packet_number_ + 1;
+  SendPacketsInOneInterval();
+  // Update the RTT so that the smoothed rtt is increased by
+  // 0.5 * FLAGS_max_rtt_fluctuation_tolerance_ratio_in_starting.
+  rtt_stats_.UpdateRtt(
+      (1 + 8 * 0.5 * FLAGS_max_rtt_fluctuation_tolerance_ratio_in_starting) *
+          rtt_stats_.smoothed_rtt(),
+      QuicTime::Delta::Zero(), QuicTime::Zero());
+  // Allow a small margin for float/int64_t cast.
+  EXPECT_LT(
+      ((1 + 0.5 * FLAGS_max_rtt_fluctuation_tolerance_ratio_in_starting) *
+          rtt).ToMicroseconds() -
+      rtt_stats_.smoothed_rtt().ToMicroseconds(), 2);
+  rtt = rtt_stats_.smoothed_rtt();
+  // Acknowledge all the packets for the second useful interval.
+  packets_acked_.clear();
+  AckPackets(start_packet_number, packet_number_ + 1);
+  sender_.OnCongestionEvent(true, 0, QuicTime::Zero(), packets_acked_,
+                            packets_lost_);
+
+  // Sender stays in STARTING mode, and increases sending rate to
+  // initial_rate_mbps * 4, where rounds_ equals 3.
+  EXPECT_EQ(PccSender::STARTING, PccSenderPeer::mode(&sender_));
+  EXPECT_EQ(3u, PccSenderPeer::rounds(&sender_));
+  ExpectApproxEq(initial_rate_mbps * 4.0f,
+                 PccSenderPeer::sending_rate(&sender_), 0.001f);
+
+  // Send all the packets for the third useful monitor interval.
+  start_packet_number = packet_number_ + 1;
+  SendPacketsInOneInterval();
+  // Update the RTT so that the smoothed rtt is further increased by
+  // 1.5 * FLAGS_max_rtt_fluctuation_tolerance_ratio_in_starting.
+  rtt_stats_.UpdateRtt(
+      (1 + 8 * 1.5 * FLAGS_max_rtt_fluctuation_tolerance_ratio_in_starting) *
+          rtt_stats_.smoothed_rtt(),
+      QuicTime::Delta::Zero(), QuicTime::Zero());
+  // Allow a small margin for float/int64_t cast.
+  EXPECT_LT(
+      ((1 + 1.5 * FLAGS_max_rtt_fluctuation_tolerance_ratio_in_starting) *
+          rtt).ToMicroseconds() -
+      rtt_stats_.smoothed_rtt().ToMicroseconds(), 2);
+  // Acknowledge all the packets for the third useful interval.
+  packets_acked_.clear();
+  AckPackets(start_packet_number, packet_number_ + 1);
+  sender_.OnCongestionEvent(true, 0, QuicTime::Zero(), packets_acked_,
+                            packets_lost_);
+
+  // Sender exits STARTING mode, and halves the sending rate to
+  // initial_rate_mbps * 2, with rounds_ reset to 1.
+  EXPECT_EQ(PccSender::PROBING, PccSenderPeer::mode(&sender_));
+  EXPECT_EQ(1u, PccSenderPeer::rounds(&sender_));
+  ExpectApproxEq(initial_rate_mbps * 2.0f,
+                 PccSenderPeer::sending_rate(&sender_), 0.001f);
+}
+
+TEST_F(PccSenderTest, NoLatencyInflationToleranceInStarting) {
+  rtt_stats_.UpdateRtt(QuicTime::Delta::FromMicroseconds(30000),
+                       QuicTime::Delta::Zero(), QuicTime::Zero());
+  float initial_rate_mbps = PccSenderPeer::sending_rate(&sender_);
+  QuicPacketNumber start_packet_number = 1;
+
+  // Disable latency inflation tolerance in STARTING.
+  base::SetFlag(&FLAGS_max_rtt_fluctuation_tolerance_ratio_in_starting, 0.0);
+
+  // Send all the packets for the first useful monitor interval.
+  SendPacketsInOneInterval();
+  // Acknowledge all the packets for the first useful interval.
+  AckPackets(start_packet_number, packet_number_ + 1);
+  sender_.OnCongestionEvent(true, 0, QuicTime::Zero(), packets_acked_,
+                            packets_lost_);
+  EXPECT_EQ(PccSender::STARTING, PccSenderPeer::mode(&sender_));
+  EXPECT_EQ(2u, PccSenderPeer::rounds(&sender_));
+  ExpectApproxEq(initial_rate_mbps * 2.0f,
+                 PccSenderPeer::sending_rate(&sender_), 0.001f);
+
+  // Send all the packets for the second useful monitor interval.
+  start_packet_number = packet_number_ + 1;
+  SendPacketsInOneInterval();
+  // Update the RTT so that the smoothed rtt is increased by 2 percent.
+  QuicTime::Delta new_rtt = (1 + 8 * 0.02) * rtt_stats_.smoothed_rtt();
+  rtt_stats_.UpdateRtt(new_rtt, QuicTime::Delta::Zero(), QuicTime::Zero());
+  EXPECT_EQ(static_cast<int64_t>(30000.0 * 1.02),
+            rtt_stats_.smoothed_rtt().ToMicroseconds());
+  // Acknowledge all the packets for the second useful interval.
+  packets_acked_.clear();
+  AckPackets(start_packet_number, packet_number_ + 1);
+  sender_.OnCongestionEvent(true, 0, QuicTime::Zero(), packets_acked_,
+                            packets_lost_);
+
+  // Sender exits STARTING mode, and halves the sending rate to
+  // initial_rate_mbps, with rounds_ reset to 1.
+  EXPECT_EQ(PccSender::PROBING, PccSenderPeer::mode(&sender_));
+  EXPECT_EQ(1u, PccSenderPeer::rounds(&sender_));
+  ExpectApproxEq(initial_rate_mbps, PccSenderPeer::sending_rate(&sender_),
+                 0.001f);
+}
+
+TEST_F(PccSenderTest, LatencyInflationToleranceInDecisionMade) {
+  QuicTime::Delta rtt = QuicTime::Delta::FromMicroseconds(30000);
+  rtt_stats_.UpdateRtt(rtt, QuicTime::Delta::Zero(), QuicTime::Zero());
+  PccSenderPeer::SetMode(&sender_, PccSender::DECISION_MADE,
+                         PccSender::INCREASE);
+  float initial_rate_mbps = PccSenderPeer::sending_rate(&sender_);
+  QuicPacketNumber start_packet_number = 1;
+
+  // Send all the packets for the first useful monitor interval.
+  SendPacketsInOneInterval();
+  // Acknowledge all the packets for the first useful interval.
+  AckPackets(start_packet_number, packet_number_ + 1);
+  sender_.OnCongestionEvent(true, 0, QuicTime::Zero(), packets_acked_,
+                            packets_lost_);
+  // Sender stays in DECISION_MADE mode, and further increases sending rate to
+  // initial_rate_mbps * (1 + rounds_ * 0.02), where rounds_ equals 2.
+  EXPECT_EQ(PccSender::DECISION_MADE, PccSenderPeer::mode(&sender_));
+  EXPECT_EQ(2u, PccSenderPeer::rounds(&sender_));
+  EXPECT_EQ(PccSender::INCREASE, PccSenderPeer::direction(&sender_));
+  ExpectApproxEq(initial_rate_mbps * 1.04f,
+                 PccSenderPeer::sending_rate(&sender_), 0.001f);
+
+  // Send all the packets for the second useful monitor interval.
+  start_packet_number = packet_number_ + 1;
+  SendPacketsInOneInterval();
+  // Update the RTT so that the smoothed rtt is increased by
+  // 0.5 * FLAGS_max_rtt_fluctuation_tolerance_ratio_in_decision_made.
+  rtt_stats_.UpdateRtt(
+      (1 + 4 * FLAGS_max_rtt_fluctuation_tolerance_ratio_in_decision_made) *
+          rtt_stats_.smoothed_rtt(),
+      QuicTime::Delta::Zero(), QuicTime::Zero());
+  // Allow a small margin for float/int64_t cast.
+  EXPECT_LT(
+      ((1 + 0.5 * FLAGS_max_rtt_fluctuation_tolerance_ratio_in_decision_made) *
+          rtt).ToMicroseconds() -
+      rtt_stats_.smoothed_rtt().ToMicroseconds(), 2);
+  rtt = rtt_stats_.smoothed_rtt();
+  // Acknowledge all the packets for the second useful interval.
+  packets_acked_.clear();
+  AckPackets(start_packet_number, packet_number_ + 1);
+  sender_.OnCongestionEvent(true, 0, QuicTime::Zero(), packets_acked_,
+                            packets_lost_);
+
+  // Sender stays in DECISION_MADE mode, and further increases sending rate by
+  // rounds_ * 0.02, where rounds_ equals 3.
+  EXPECT_EQ(PccSender::DECISION_MADE, PccSenderPeer::mode(&sender_));
+  EXPECT_EQ(3u, PccSenderPeer::rounds(&sender_));
+  EXPECT_EQ(PccSender::INCREASE, PccSenderPeer::direction(&sender_));
+  ExpectApproxEq(initial_rate_mbps * 1.04f * 1.06f,
+                 PccSenderPeer::sending_rate(&sender_), 0.001f);
+
+  // Send all the packets for the third useful monitor interval.
+  start_packet_number = packet_number_ + 1;
+  SendPacketsInOneInterval();
+  // Update the RTT so that the smoothed rtt is further increased by
+  // 1.5 * FLAGS_max_rtt_fluctuation_tolerance_ratio_in_decision_made.
+  rtt_stats_.UpdateRtt(
+      (1 + 12 * FLAGS_max_rtt_fluctuation_tolerance_ratio_in_decision_made) *
+          rtt_stats_.smoothed_rtt(),
+      QuicTime::Delta::Zero(), QuicTime::Zero());
+  // Allow a small margin for float/int64_t cast.
+  EXPECT_LT(
+      ((1 + 1.5 * FLAGS_max_rtt_fluctuation_tolerance_ratio_in_decision_made) *
+          rtt).ToMicroseconds() -
+      rtt_stats_.smoothed_rtt().ToMicroseconds(), 2);
+  // Acknowledge all the packets for the third useful interval.
+  packets_acked_.clear();
+  AckPackets(start_packet_number, packet_number_ + 1);
+  sender_.OnCongestionEvent(true, 0, QuicTime::Zero(), packets_acked_,
+                            packets_lost_);
+
+  // Sender will enter PROBING mode, and change sending rate to central rate
+  // initial_rate_mbps * 1.04. Also, rounds_ is reset to 1.
+  EXPECT_EQ(PccSender::PROBING, PccSenderPeer::mode(&sender_));
+  EXPECT_EQ(1u, PccSenderPeer::rounds(&sender_));
+  ExpectApproxEq(initial_rate_mbps * 1.04f,
+                 PccSenderPeer::sending_rate(&sender_), 0.001f);
+}
+
+TEST_F(PccSenderTest, NoLatencyInflationToleranceInDecisionMade) {
+  rtt_stats_.UpdateRtt(QuicTime::Delta::FromMicroseconds(30000),
+                       QuicTime::Delta::Zero(), QuicTime::Zero());
+  PccSenderPeer::SetMode(&sender_, PccSender::DECISION_MADE,
+                         PccSender::INCREASE);
+  float initial_rate_mbps = PccSenderPeer::sending_rate(&sender_);
+  QuicPacketNumber start_packet_number = 1;
+
+  // Disable latency inflation tolerance in DECISION_MADE.
+  base::SetFlag(&FLAGS_max_rtt_fluctuation_tolerance_ratio_in_decision_made,
+                0.0);
+
+  // Send all the packets for the first useful monitor interval.
+  SendPacketsInOneInterval();
+  // Acknowledge all the packets for the first useful interval.
+  AckPackets(start_packet_number, packet_number_ + 1);
+  sender_.OnCongestionEvent(true, 0, QuicTime::Zero(), packets_acked_,
+                            packets_lost_);
+  // Sender stays in DECISION_MADE mode, and further increases sending rate to
+  // initial_rate_mbps * (1 + rounds_ * 0.02), where rounds_ equals 2.
+  EXPECT_EQ(PccSender::DECISION_MADE, PccSenderPeer::mode(&sender_));
+  EXPECT_EQ(2u, PccSenderPeer::rounds(&sender_));
+  EXPECT_EQ(PccSender::INCREASE, PccSenderPeer::direction(&sender_));
+  ExpectApproxEq(initial_rate_mbps * 1.04f,
+                 PccSenderPeer::sending_rate(&sender_), 0.001f);
+
+  // Send all the packets for the second useful monitor interval.
+  start_packet_number = packet_number_ + 1;
+  SendPacketsInOneInterval();
+  // Update the RTT so that the smoothed rtt is increased by 2 percent.
+  QuicTime::Delta new_rtt = (1 + 8 * 0.02) * rtt_stats_.smoothed_rtt();
+  rtt_stats_.UpdateRtt(new_rtt, QuicTime::Delta::Zero(), QuicTime::Zero());
+  EXPECT_EQ(static_cast<int64_t>(30000.0 * 1.02),
+            rtt_stats_.smoothed_rtt().ToMicroseconds());
+  // Acknowledge all the packets for the second useful interval.
+  packets_acked_.clear();
+  AckPackets(start_packet_number, packet_number_ + 1);
+  sender_.OnCongestionEvent(true, 0, QuicTime::Zero(), packets_acked_,
+                            packets_lost_);
+
+  // Sender will enter PROBING mode, and change sending rate to
+  // initial_rate_mbps. Also, rounds_ is reset to 1.
+  EXPECT_EQ(PccSender::PROBING, PccSenderPeer::mode(&sender_));
+  EXPECT_EQ(1u, PccSenderPeer::rounds(&sender_));
+  ExpectApproxEq(initial_rate_mbps, PccSenderPeer::sending_rate(&sender_),
+                 0.001f);
+}
+
 TEST_F(PccSenderTest, DecisionMadeToProbing) {
   rtt_stats_.UpdateRtt(QuicTime::Delta::FromMilliseconds(30),
                        QuicTime::Delta::Zero(), QuicTime::Zero());
-  // Update avg_rtt_.
-  sender_.OnCongestionEvent(true, 0, QuicTime::Zero(), packets_acked_,
-                            packets_lost_);
   PccSenderPeer::SetMode(&sender_, PccSender::DECISION_MADE,
                          PccSender::INCREASE);
   float initial_rate_mbps = PccSenderPeer::sending_rate(&sender_);
@@ -367,19 +635,13 @@ TEST_F(PccSenderTest, DecisionMadeToProbing) {
 }
 
 TEST_F(PccSenderTest, StayInProbingBecauseInsufficientResults) {
-  // Send Packets in 10 monitor intervals without initializing RTT stats. All
-  // 10 intervals are non useful.
-  for (size_t i = 0; i < 10; ++i) {
-    SendPacketsInOneInterval();
-  }
+  // Sent a packet to create a non-useful interval in the queue.
+  sender_.OnPacketSent(clock_.Now(), 0, ++packet_number_, kMaxPacketSize,
+                       HAS_RETRANSMITTABLE_DATA);
+  // Advance the clock by 100 us, so the next packet is sent at different time.
+  clock_.AdvanceTime(QuicTime::Delta::FromMicroseconds(100));
   rtt_stats_.UpdateRtt(QuicTime::Delta::FromMilliseconds(30),
                        QuicTime::Delta::Zero(), QuicTime::Zero());
-  // Each non-useful interval should contain only a single packet.
-  EXPECT_EQ(10u, packet_number_);
-  // Acknowledge the sent packet, so that avg_rtt_ can be updated.
-  AckPackets(1, packet_number_ + 1);
-  sender_.OnCongestionEvent(true, 0, QuicTime::Zero(), packets_acked_,
-                            packets_lost_);
   PccSenderPeer::SetMode(&sender_, PccSender::PROBING, PccSender::INCREASE);
   float initial_rate_mbps = PccSenderPeer::sending_rate(&sender_);
 
@@ -388,7 +650,7 @@ TEST_F(PccSenderTest, StayInProbingBecauseInsufficientResults) {
     SendPacketsInOneInterval();
   }
 
-  AckPackets(10, packet_number_ + 1);
+  AckPackets(1, packet_number_ + 1);
   sender_.OnCongestionEvent(true, 0, QuicTime::Zero(), packets_acked_,
                             packets_lost_);
   // The sender cannot make a decision because there are less than
@@ -398,57 +660,6 @@ TEST_F(PccSenderTest, StayInProbingBecauseInsufficientResults) {
   EXPECT_EQ(2u, PccSenderPeer::rounds(&sender_));
   ExpectApproxEq(initial_rate_mbps, PccSenderPeer::sending_rate(&sender_),
                  0.001f);
-}
-
-TEST_F(PccSenderTest, FilteringAggregatedAck) {
-  float initial_rate_mbps = PccSenderPeer::sending_rate(&sender_);
-  QuicTime event_time = QuicTime::Zero();
-
-  // First initialize the latest rtt to be 30ms.
-  rtt_stats_.UpdateRtt(QuicTime::Delta::FromMilliseconds(30),
-                       QuicTime::Delta::Zero(), QuicTime::Zero());
-  // Update avg_rtt_.
-  sender_.OnCongestionEvent(true, 0, event_time, packets_acked_, packets_lost_);
-  // Update the latest rtt sample to be 300ms.
-  rtt_stats_.UpdateRtt(QuicTime::Delta::FromMilliseconds(300),
-                       QuicTime::Delta::Zero(), QuicTime::Zero());
-
-  SendPacketsInOneInterval();
-  // Acknowledge packets in the interval, leaving the last packet un-acked.
-  // After that, the sender will store 300ms in last_rtt_, and avg_rtt_ remains
-  // to be 30ms.
-  AckPackets(1, packet_number_);
-  sender_.OnCongestionEvent(true, 0, event_time, packets_acked_, packets_lost_);
-  packets_acked_.clear();
-  // Acknowledge the last packet after only 1us from the last ack. The sender
-  // will not update avg_rtt_.
-  event_time = event_time + QuicTime::Delta::FromMicroseconds(1);
-  AckPackets(packet_number_, packet_number_ + 1);
-  sender_.OnCongestionEvent(true, 0, event_time, packets_acked_, packets_lost_);
-  packets_acked_.clear();
-
-  // The 300ms rtt sample will be filtered out due to aggregation. Sender stays
-  // in STARING, and sending rate is doubled.
-  ExpectApproxEq(2.0f * initial_rate_mbps,
-                 PccSenderPeer::sending_rate(&sender_), 0.001f);
-  EXPECT_EQ(PccSender::STARTING, PccSenderPeer::mode(&sender_));
-  EXPECT_EQ(2u, PccSenderPeer::rounds(&sender_));
-  EXPECT_EQ(PccSender::INCREASE, PccSenderPeer::direction(&sender_));
-
-  // Send packets for another interval, and acknowledge the packets after a long
-  // interval of 100 ms from the last ack. That triggers the update of avg_rtt_.
-  QuicPacketNumber start_packet_number = packet_number_;
-  SendPacketsInOneInterval();
-  event_time = event_time + QuicTime::Delta::FromMilliseconds(100);
-  AckPackets(start_packet_number, packet_number_ + 1);
-  sender_.OnCongestionEvent(true, 0, event_time, packets_acked_, packets_lost_);
-  // The interval between two consecutive acks are large enough. The 300ms
-  // last_rtt_ leads to an increasing avg_rtt_ in PccSender, causing the sender
-  // to exit STARTING and enter PROBING mode.
-  ExpectApproxEq(initial_rate_mbps, PccSenderPeer::sending_rate(&sender_),
-                 0.001f);
-  EXPECT_EQ(PccSender::PROBING, PccSenderPeer::mode(&sender_));
-  EXPECT_EQ(1u, PccSenderPeer::rounds(&sender_));
 }
 
 }  // namespace
