@@ -1,0 +1,38 @@
+name: "pcc_quic"
+description:
+  "From the homepage:  'Performance-oriented Congestion Control (PCC) is a "
+  "new architecture that achieves consistent high performance even under "
+  "challenging conditions. PCC senders continuously observe the connection "
+  "between their actions and empirically experienced performance, enabling "
+  "them to consistently adopt actions that result in high performance.' "
+  "This particular implementation of the PCC algorithm is compatible "
+  "with the chromium QUIC implementation."
+
+third_party {
+  url {
+    type: HOMEPAGE
+    value: "http://modong.github.io/pcc-page/"
+  }
+  url {
+    type: GIT
+    value: "https://github.com/netarch/PCC_QUIC"
+  }
+  version: "strategyTest"
+  last_upgrade_date { year: 2017 month: 5 day: 3 }
+}
+
+presubmit: {
+  path_expression: "//depot/google3/third_party/pcc_quic/..."
+
+  review_notify: "quic-dev"
+
+  check_tests: {
+    failure_status: ERROR
+    project: "gfe.dbg.flags"
+    project: "gfe.opt"
+    project: "quic.dbg.flags"
+    project: "quic.opt"
+    project: "quic.android.arm"
+    project: "quic.ios.armv7"
+  }
+}
