@@ -64,6 +64,7 @@ cc_library(
         "//third_party/quic/core/congestion_control:quic_congestion_control_hdrs",
         "//third_party/quic/core/congestion_control:rtt_stats_lib",
         "//third_party/quic/core/congestion_control:windowed_filter_lib",
+        "//third_party/quic/platform/api:quic_flag_utils_lib",
         "//third_party/quic/platform/api:quic_logging_lib",
         "//third_party/quic/platform/api:quic_str_cat_lib",
     ],

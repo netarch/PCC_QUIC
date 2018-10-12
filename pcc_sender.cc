@@ -6,6 +6,7 @@
 #include "base/commandlineflags.h"
 #include "third_party/quic/core/congestion_control/rtt_stats.h"
 #include "third_party/quic/core/quic_time.h"
+#include "third_party/quic/platform/api/quic_flag_utils.h"
 #include "third_party/quic/platform/api/quic_str_cat.h"
 
 namespace quic {
