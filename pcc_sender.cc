@@ -469,6 +469,7 @@ bool PccSender::CanMakeDecision(
   // 2 * kNumIntervalGroupsInProbing. This happens when sender does not have
   // enough data to send.
   if (utility_info.size() < 2 * kNumIntervalGroupsInProbing) {
+    QUIC_CODE_COUNT_N(probing_mode_results, 1, 4);
     return false;
   }
 
@@ -488,6 +489,7 @@ bool PccSender::CanMakeDecision(
     }
     // Cannot make decision if groups have inconsistent results.
     if (increase_i != increase) {
+      QUIC_CODE_COUNT_N(probing_mode_results, 2, 4);
       return false;
     }
   }
@@ -532,9 +534,11 @@ void PccSender::EnterDecisionMade() {
   // Change sending rate from central rate based on the probing rate with higher
   // utility.
   if (direction_ == INCREASE) {
+    QUIC_CODE_COUNT_N(probing_mode_results, 3, 4);
     sending_rate_ = sending_rate_ * (1 + kProbingStepSize) *
                     (1 + kDecisionMadeStepSize);
   } else {
+    QUIC_CODE_COUNT_N(probing_mode_results, 4, 4);
     sending_rate_ = sending_rate_ * (1 - kProbingStepSize) *
                     (1 - kDecisionMadeStepSize);
   }
